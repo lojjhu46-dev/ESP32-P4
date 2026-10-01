@@ -1,0 +1,63 @@
+## IDF Component Manager Manifest File
+dependencies:
+  idf: '>=5.5'
+
+  # ---- Wi-Fi/BLE via onboard ESP32-C6 ----
+  # 暂时停用：模块上的 C6 从机固件是 esp-hosted 2.3.2，而本 IDF 5.5.5 的宿主驱动
+  # 是 3.0.x，日志报 "major version mismatch"，wifi 初始化不返回；且只把代码里的
+  # app_wifi_init() 关掉、组件仍在图里时，esp_hosted 的 SDIO 传输构造函数会
+  # assert(xQueueSemaphoreTake(NULL)) 重启。故整条链路从构建里摘掉，
+  # 等 C6 固件升级到与宿主匹配后再把这一行和 main/CMakeLists.txt 里的
+  # `esp_wifi_remote esp_wifi` 一起恢复（Kconfig APP_ENABLE_WIFI 也要同步）。
+  # espressif/esp_wifi_remote: ^0.14.2
+
+  # ---- UI ----
+  # lvgl 也走本地检出：managed_components 里的副本会被组件管理器判为"需要重装"，
+  # 进而触发批量删除保护（6563 个文件），而注册表在我们的网络下不可达。
+  lvgl/lvgl:
+    version: "*"
+    override_path: "../../lvgl"
+  espressif/esp_lvgl_port: ^2
+  espressif/esp_lcd_touch_gt911: ^1
+
+  # ---- Audio codec (ES8311 + ES7210) ----
+  espressif/esp_codec_dev: ^1.3
+
+  # ---- Camera (MIPI-CSI, esp_video V4L2 stack) ----
+  # 这两个组件用本地检出 + override_path（原因见下）：为了能改驱动
+  #   ① esp_video_local：在 isp_video_set_ext_ctrl() 的 default 分支接上
+  #      esp_video_set_ext_ctrls_to_sensor()（原库是死代码，sensor 侧控制全传不进去），
+  #      并在 control_map 表里加"帧率"映射；
+  #   ② esp_cam_sensor_local：给 sc2336 加 VTS/帧率控制（夜视长曝光用）。
+  # 上游升级后需重新把这两处 patch 打上（见 docs/HANDOVER.md 第十节）。
+  espressif/esp_video:
+    version: "^0.9.1"
+    override_path: "../../esp_video"
+  espressif/esp_cam_sensor:
+    version: "^1.0.0"
+    override_path: "../../esp_cam_sensor"
+  espressif/esp_ipa: ^0.3.0
+
+  # ---- USB CDC PC link (JCLINK) ----
+  espressif/esp_tinyusb: ^2.0.0
+
+  # ---- Edge AI: esp-dl + face models ----
+  # 组件注册表(components.espressif.com)在本机网络不可达（DNS/TCP 均不通），
+  # 故全部用本地检出 + override_path（相对本文件所在目录）离线构建：
+  #   D:\esp32project\ESP32-P4\esp-dl        (git clone --depth 1 -b v3.3.11)
+  #   D:\esp32project\ESP32-P4\esp-adf-libs  (sparse-checkout: esp_new_jpeg)
+  espressif/esp-dl:
+    version: "*"
+    override_path: "../../esp-dl/esp-dl"
+  espressif/dl_fft:
+    version: ">=0.6.0"
+    override_path: "../../esp-dl/tools/dl_fft"
+  espressif/esp_new_jpeg:
+    version: "^1"
+    override_path: "../../esp-adf-libs/esp_new_jpeg"
+  espressif/human_face_detect:
+    version: "~0.5.0"
+    override_path: "../../esp-dl/models/human_face_detect"
+  espressif/human_face_recognition:
+    version: "*"
+    override_path: "../../esp-dl/models/human_face_recognition"

@@ -1,0 +1,166 @@
+menu "JC P4 App Configuration"
+
+    config APP_WIFI_SSID
+        string "Wi-Fi SSID to connect (empty = scan only)"
+        default ""
+        help
+            Leave empty to only scan APs at startup.
+
+    config APP_WIFI_PASSWORD
+        string "Wi-Fi password"
+        default ""
+
+    config APP_ENABLE_DISPLAY
+        bool "Enable MIPI-DSI display + touch + LVGL"
+        default y
+        help
+            Set to n during the no-screen period (PC as HMI via USB)
+            to skip DSI/LVGL init and save memory.
+
+    config APP_ENABLE_USB_LINK
+        bool "Enable USB CDC PC link (JCLINK protocol)"
+        default y
+        help
+            PC acts as camera + display over USB0 HS CDC.
+
+    config APP_ENABLE_IMG_PIPE
+        bool "Enable image pipe (JCLINK JPEG -> hw decode -> RGB888)"
+        default y
+        depends on APP_ENABLE_USB_LINK
+        help
+            Decodes JPEG frames from the PC link with the P4 hardware JPEG
+            decoder and publishes RGB888 frames to app_faceai / the preview.
+
+    config APP_ENABLE_FACEAI
+        bool "Enable edge AI (esp-dl human face detect/recognize)"
+        default y
+        depends on APP_ENABLE_IMG_PIPE
+        help
+            Face detection + feature extraction + 1:N match on board;
+            frames come from app_imgpipe, feature db lives on the
+            'storage' FAT partition (/storage/face.db) + NVS name table.
+
+    config APP_FACEAI_DETECT_THR
+        int "Face detect score threshold (%)"
+        range 10 95
+        default 50
+        depends on APP_ENABLE_FACEAI
+        help
+            MSR and MNP score threshold, 50 = esp-dl default 0.5.
+
+    config APP_FACEAI_MATCH_THR
+        int "Face match cosine similarity threshold (%)"
+        range 30 99
+        default 70
+        depends on APP_ENABLE_FACEAI
+        help
+            Cosine similarity above which a feature is accepted as a match.
+            Runtime override: {"cmd":"mode","thr":0.75}
+
+    config APP_FACEAI_MAX_BOXES
+        int "Max face boxes reported per result frame"
+        range 1 10
+        default 5
+        depends on APP_ENABLE_FACEAI
+
+    config APP_ENABLE_WIFI
+        bool "Enable Wi-Fi via ESP32-C6 (ESP-Hosted)"
+        default y
+        help
+            Currently the on-board C6 co-processor runs esp-hosted slave fw 2.3.2
+            while the host driver in this build is 3.0.7 -> "major version mismatch"
+            and wifi init never completes (main task spins, TWDT). Set to n to boot
+            without Wi-Fi (PC-as-HMI / USB-CDC pipeline does not need it).
+
+    config APP_CAM_WB_KR
+        int "software WB red gain per-mille (1000 = off)"
+        default 1320
+
+    config APP_CAM_WB_KB
+        int "software WB blue gain per-mille (1000 = off)"
+        default 1645
+
+    config APP_CAM_HFLIP
+        bool "Mirror camera frames back (module is mounted mirrored)"
+        default y
+        help
+            摄像头模组安装方向导致画面左右反（驱动层改不了：esp_video 的 sensor
+            ext-ctrl 转发是死代码、ISP 的 0x00980914/15 只可枚举不可读写），
+            因此在图像管道里对摄像头帧做行内镜像。运行时可用
+            {"cmd":"cam","mirror":true|false} 切换。
+
+    config APP_CAM_DN
+        int "temporal denoise level at boot (0=off 1=low 2=mid 3=high)"
+        default 0
+        range 0 3
+        help
+            时域降噪：对"没动的地方"做多帧加权平均压制随机噪声（弱光/夜视真正见效的
+            手段；只降增益几乎不改善信噪比）。运行时用 {"cmd":"cam","dn":0..3} 或
+            模拟器 UI 第 4 行的 DN 档按钮切换。0 = 关闭（零额外开销）。
+
+    config APP_CAM_DN_MAX_FPS
+        int "skip temporal denoise above this camera fps (0 = never skip)"
+        default 25
+        help
+            帧率守卫：摄像头帧率高于此值时跳过降噪，避免 PSRAM 带宽/CPU 压力把
+            camera 任务(prio 6)拖垮（历史踩过 task_wdt 的坑）。夜视档（10fps）
+            会正常启用；默认 25 意味着 50fps 档位不降噪。
+
+    config APP_CAM_DEF_GAIN
+        int "Camera default gain index (SC2336: 0..192; 72 = indoor normal)"
+        default 72
+        help
+            esp_video 的 AE/AGC 在当前配置下不会调增益（实测恒为 0 = 最小），
+            而 SC2336 的增益范围是 0..192。不设默认值的话夜景就是一片黑
+            (avg_luma≈30)。PC/UI 可以用 {"cmd":"cam","gain":N} 随时改。
+
+    config APP_ENABLE_STREAM
+        bool "Enable image stream back to PC (JCLINK 0x05, hw JPEG encode)"
+        default y
+        depends on APP_ENABLE_IMG_PIPE
+        help
+            Sends downscaled/encoded JPEG frames of the pipeline to the PC so the
+            LVGL simulator (or host_app.py) can show what the board sees. Off until
+            the PC asks with {"cmd":"stream","value":"on"}.
+
+    config APP_ENABLE_AUDIO
+        bool "Enable audio codec (ES8311/ES7210) init + beep"
+        default y
+
+    config APP_ENABLE_ETH
+        bool "Enable RMII Ethernet (IP101GRI)"
+        default y
+
+    config APP_ETH_STATIC_IP
+        string "Static IPv4 fallback when DHCP gets no lease (empty = DHCP only)"
+        default "192.168.33.2"
+        depends on APP_ENABLE_ETH
+        help
+            直连 PC 时 PC 一般不做 DHCP，这里给板子配一个与 PC 同网段的静态地址
+            （PC 当前是 192.168.33.53/23）。
+
+    config APP_ETH_STATIC_NETMASK
+        string "Netmask for the static IPv4 fallback"
+        default "255.255.254.0"
+        depends on APP_ENABLE_ETH
+
+    config APP_ENABLE_NET_LINK
+        bool "Enable JCLINK over TCP (PC link via Ethernet, port below)"
+        default y
+        depends on APP_ENABLE_ETH
+        help
+            用 TCP 替代 USB CDC 跑同一套 JCLINK 帧协议：板子做 server，
+            PC 用 socket 连接；有客户端连接时 0x02/0x04 回包走 TCP，
+            断开后自动回落到 USB CDC。
+
+    config APP_NETLINK_PORT
+        int "TCP port for JCLINK over Ethernet"
+        range 1024 65535
+        default 3333
+        depends on APP_ENABLE_NET_LINK
+
+    config APP_ENABLE_CAMERA
+        bool "Enable MIPI-CSI camera (esp_video, SC2336)"
+        default y
+
+endmenu
