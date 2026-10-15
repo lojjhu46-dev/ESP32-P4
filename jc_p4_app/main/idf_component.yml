@@ -3,13 +3,14 @@ dependencies:
   idf: '>=5.5'
 
   # ---- Wi-Fi/BLE via onboard ESP32-C6 ----
-  # 暂时停用：模块上的 C6 从机固件是 esp-hosted 2.3.2，而本 IDF 5.5.5 的宿主驱动
-  # 是 3.0.x，日志报 "major version mismatch"，wifi 初始化不返回；且只把代码里的
-  # app_wifi_init() 关掉、组件仍在图里时，esp_hosted 的 SDIO 传输构造函数会
-  # assert(xQueueSemaphoreTake(NULL)) 重启。故整条链路从构建里摘掉，
-  # 等 C6 固件升级到与宿主匹配后再把这一行和 main/CMakeLists.txt 里的
-  # `esp_wifi_remote esp_wifi` 一起恢复（Kconfig APP_ENABLE_WIFI 也要同步）。
-  # espressif/esp_wifi_remote: ^0.14.2
+  # 2026-10-02 恢复：当初摘除是因为解析到 esp_hosted 3.0.7 与出厂 C6 从机固件 2.3.2
+  # 协议不匹配（"major version mismatch"）。厂商 wifi_scan 模板的 dependencies.lock
+  # 给出了与出厂固件配套的验证版本对（见 HANDOVER 第十九节），钉死如下。
+  # 注册表 components.espressif.com 已恢复可达（2026-10-02 实测 HTTP 200）。
+  espressif/esp_wifi_remote:
+    version: "0.14.2"
+  espressif/esp_hosted:
+    version: "2.12.13"
 
   # ---- UI ----
   # lvgl 也走本地检出：managed_components 里的副本会被组件管理器判为"需要重装"，

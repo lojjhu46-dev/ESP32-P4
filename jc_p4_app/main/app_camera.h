@@ -22,6 +22,9 @@ esp_err_t app_camera_init(void);
 /* 摄像头是否已出流（imgpipe 用它决定默认图像源） */
 bool app_camera_ready(void);
 
+/* 传感器 HMIRROR 是否已生效（为真时 imgpipe 跳过软件行内镜像） */
+bool app_camera_sensor_hflip(void);
+
 /* ---------------- 图像参数（曝光/增益/ISP 亮度…）----------------
  * 走 V4L2 controls（esp_video 的 /dev/videoX）：
  *   V4L2_CID_EXPOSURE   曝光，sc2336 单位 100µs（如 200 = 20ms）
@@ -62,6 +65,49 @@ enum {
 
 esp_err_t app_camera_get_ctrl(app_cam_ctrl_t *out);
 esp_err_t app_camera_set_ctrl(const app_cam_ctrl_t *in, uint32_t mask);
+
+/*
+ * 写操作信箱（自动路径专用）：把 exp/gain/fps 的写请求投递给 camera 任务，
+ * 在它自己循环的安全点（QBUF 之后、下一次 DQBUF 之前）串行执行。
+ *
+ * ⚠️ 背景：faceai 上下文的 V4L2 ioctl 与 camera 任务的取流/大数据处理（运动估计）
+ * 并发时实测会触发无日志整板重启（见 HANDOVER.md），且跨任务 ioctl 会争 esp_video
+ * 的设备锁造成卡顿。自动路径（AE 调节、auto_fps 切换/boost）用信箱后
+ * 与取流完全同任务串行，这两类问题都不存在。手动命令保持直接写（低频、已有实测）。
+ * 火后不管：同类请求自动合并（只保留最后一次），结果不回传。
+ */
+void app_camera_post_exp_gain(int32_t exp, int32_t gain);
+void app_camera_post_fps(int32_t fps);
+
+/*
+ * ISP 硬件白平衡（/dev/video20 的 V4L2_CID_USER_ESP_ISP_WB，WBG 增益乘进 CCM，
+ * 零 CPU 成本；原先软件 WB 是每帧 614KB 的 LUT 内存遍历）。写请求同样走信箱。
+ * wb_available() 为 false（video20 打不开）时调用方退回 imgpipe 软件白平衡。
+ */
+bool app_camera_wb_available(void);
+bool app_camera_post_wb(int32_t wkr, int32_t wkb);
+
+/*
+ * ISP 硬件伽马曲线（夜视暗部提亮；关掉 IPA 后丢失的低光增强之一，app 层恢复）。
+ * gamma_permille：1000 = 线性（模块开但无提亮）、<1000 = 提亮（如 650，同 IPA 的
+ * gamma_param 0.688 量级）、0 = 禁用模块。曲线 16 点由 app 构造（满足 IDF 驱动
+ * "x 相邻差为 2 的幂、末点 255" 的硬校验）。走写操作信箱，返回 false = 通道不可用。
+ */
+bool app_camera_post_gamma(int32_t gamma_permille);
+
+/*
+ * ISP 硬件 BF（bayer filter，拜耳域降噪；关掉 IPA 后丢失的低光增强之二）。
+ * bf_level：0 = 禁用，2..20（app 自适应只用 3..6）。走写操作信箱。
+ */
+bool app_camera_post_bf(int32_t bf_level);
+
+/*
+ * ISP 硬件 CCM（颜色校正矩阵；关掉 IPA 后丢失的颜色校准，app 层恢复）。
+ * ccm_mix 千分比：0 = 禁用模块、1000 = 完整厂商标定矩阵（sc2336_default.json
+ * acc/ccm，行和 1.0 亮度守恒）、>1000 = 过饱和方向。矩阵与单位阵插值。
+ * 独立硬件模块，与 WBG 白平衡互不影响。走写操作信箱。
+ */
+bool app_camera_post_ccm(int32_t ccm_mix);
 
 /* ---------------- sensor 侧 controls（esp_cam_sensor 的 class<<16|id 体系）----------------
  * 这些 id 不在 V4L2 user class 里，必须用 EXT controls（ctrl_class=0）直连 sensor 驱动。

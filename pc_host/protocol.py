@@ -21,9 +21,11 @@ T_RESULT = 0x02
 T_CMD = 0x03
 T_LOG = 0x04
 T_IMAGE = 0x05          # board -> PC 图像帧（见 jc_p4_app/main/app_stream.h）
+T_BLOCK = 0x06          # 双向：块数据分片 offset(u32 LE)+data（F10 特征库备份/恢复）
 
 MAX_PAYLOAD = 1024 * 1024   # 与板端 JCL_MAX_PAYLOAD 保持一致（0x05 raw 帧 614KB）
-TYPE_NAME = {T_JPEG: "JPEG", T_RESULT: "RESULT", T_CMD: "CMD", T_LOG: "LOG", T_IMAGE: "IMAGE"}
+TYPE_NAME = {T_JPEG: "JPEG", T_RESULT: "RESULT", T_CMD: "CMD", T_LOG: "LOG",
+             T_IMAGE: "IMAGE", T_BLOCK: "BLOCK"}
 
 # 0x05 载荷头（小端）：fmt u8 | flags u8 | width u16 | height u16 | seq u16
 IMG_HDR_LEN = 8
@@ -159,6 +161,10 @@ class Link:
     def send_jpeg(self, data: bytes) -> None:
         self.send(T_JPEG, data)
 
+    def send_block(self, offset: int, data: bytes) -> None:
+        """发一个 0x06 块分片：offset(u32 LE) + data（F10 备份导入用）"""
+        self.send(T_BLOCK, struct.pack("<I", offset) + data)
+
     def recv(self, timeout: float | None = None, want=(T_RESULT, T_LOG)):
         """收帧；(type, seq, payload) 或 None(超时)。0x04 日志会被收集到 self.logs 并打印"""
         deadline = time.monotonic() + (self.timeout if timeout is None else timeout)
@@ -188,6 +194,14 @@ class Link:
             return None
         return ImageFrame(frame[2])
 
+    def recv_block(self, timeout: float | None = None):
+        """等一个 0x06 块分片，返回 (offset, data) 或 None（F10 备份导出用）"""
+        frame = self.recv(timeout=timeout, want=(T_BLOCK,))
+        if frame is None or len(frame[2]) < 4:
+            return None
+        off = struct.unpack_from("<I", frame[2], 0)[0]
+        return off, frame[2][4:]
+
     def recv_any(self, timeout: float | None = None):
         """等任意 0x02 或 0x05，返回 ('result', dict) / ('image', ImageFrame) / None"""
         import json
@@ -205,12 +219,16 @@ class Link:
     def cmd_and_wait(self, obj: dict, timeout: float | None = None):
         """发命令并等它自己的 ack（板端命令回复带 "ack":<cmd> 字段）。
 
-        摄像头常驻推流时 0x02 里混着流式结果帧，靠 ack 字段区分；
-        期间收到的流式帧会打印一行摘要，超时则返回最后收到的那帧。
+        ⚠️ ack 必须**按命令名精确匹配**：板端回显 ack=<命令名>，而取景中枢
+        （board_hub.py）保活会补发 stream on，其 ack 也带 "ack":"stream"——
+        只认"有 ack 字段"会把中枢的 ack 错当成自己命令的应答（2026-10-06
+        经中枢跑回归实测踩到：mode 命令收到 stream 的 ack，msg 全错）。
+        期间收到的其他帧（流式结果/外来 ack）被跳过，超时返回最后收到的一帧。
         """
         import json
 
         self.send_json_cmd(obj)
+        expected = obj.get("cmd") if isinstance(obj, dict) else None
         deadline = time.monotonic() + (self.timeout if timeout is None else timeout)
         last = None
         while time.monotonic() < deadline:
@@ -223,7 +241,9 @@ class Link:
                 continue
             last = reply
             if "ack" in reply:
-                return reply
+                if expected is None or reply.get("ack") == expected:
+                    return reply
+                continue        # 外来命令的 ack（如中枢补发的 stream）：跳过
             print(f"  [stream] faces={reply.get('faces')} event={reply.get('event')} "
                   f"src={reply.get('src')}")
         return last

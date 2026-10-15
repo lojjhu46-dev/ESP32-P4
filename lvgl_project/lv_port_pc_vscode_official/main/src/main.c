@@ -198,7 +198,8 @@ static lv_display_t * hal_init(int32_t w, int32_t h)
 
   LV_IMAGE_DECLARE(mouse_cursor_icon); /*Declare the image file.*/
   lv_obj_t * cursor_obj;
-  cursor_obj = lv_image_create(lv_screen_active()); /*Create an image object for the cursor */
+  /* 光标放系统层：弹窗的 lv_layer_top 背板会盖住屏幕层，指针会被遮罩压暗 */
+  cursor_obj = lv_image_create(lv_layer_sys()); /*Create an image object for the cursor */
   lv_image_set_src(cursor_obj, &mouse_cursor_icon);           /*Set the image source*/
   lv_indev_set_cursor(mouse, cursor_obj);             /*Connect the image  object to the driver*/
 

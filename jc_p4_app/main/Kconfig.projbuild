@@ -48,14 +48,111 @@ menu "JC P4 App Configuration"
         help
             MSR and MNP score threshold, 50 = esp-dl default 0.5.
 
-    config APP_FACEAI_MATCH_THR
-        int "Face match cosine similarity threshold (%)"
+    choice APP_FACEAI_DETECT_MODEL
+        prompt "Face detection model (F11)"
+        default APP_FACEAI_DETECT_MSRMNP
+        depends on APP_ENABLE_FACEAI
+        help
+            检测模型二选一：
+              MSRMNP（MSR+MNP 两级，~15ms，mAP50-95 0.366）—— 长期默认；
+              ESPDet_Pico_224_224_face（单级，~50ms，mAP 0.504）。
+            ⚠️ 2026-10-05 真机实测：MSRMNP 在相似构图下对注册者本人检出 45%，
+            对"另一位真人"只有 0~7%（PC 送图 100%）——检测成了识别链路的瓶颈，
+            故切到 ESPDet 验证。
+            切换前必须让对应模型打进固件：`CONFIG_FLASH_ESPDET_PICO_224_224_FACE=y`
+            （在 esp-dl/models/human_face_detect/Kconfig；模型 544KB，打包进
+            human_face_detect.espdl rodata blob）。检测阈值可用
+            `{"cmd":"mode","det_thr":0.35}` 运行时可调，不必重烧。
+
+        config APP_FACEAI_DETECT_MSRMNP
+            bool "MSRMNP S8 V1 (fast ~15ms, weak recall)"
+        config APP_FACEAI_DETECT_ESPDET_PICO_224
+            bool "ESPDet Pico 224x224 face (slower ~50ms, better recall)"
+    endchoice
+
+    config APP_FACEAI_DETECT_IS_ESPDET
+        bool
+        default y if APP_FACEAI_DETECT_ESPDET_PICO_224
+        default n
+
+    config APP_FACEAI_MATCH_THR_HI
+        int "Face match similarity threshold HI (%) - fast confirm"
+        range 30 99
+        default 80
+        depends on APP_ENABLE_FACEAI
+        help
+            Per-window best similarity >= HI confirms a match after 3 frames
+            in the smoothing window (gray zone needs 4). Runtime override:
+            {"cmd":"mode","thr_hi":0.85} (or "thr":x to set LO and shift HI).
+
+    config APP_FACEAI_MATCH_THR_LO
+        int "Face match similarity threshold LO (%) - gray zone floor"
         range 30 99
         default 70
         depends on APP_ENABLE_FACEAI
         help
-            Cosine similarity above which a feature is accepted as a match.
-            Runtime override: {"cmd":"mode","thr":0.75}
+            Similarity in [LO, HI) is a gray zone and needs one extra
+            confirming frame; below LO counts as no-hit. Calibrate with
+            pc_host/thr_calib.py. Runtime override: {"cmd":"mode","thr_lo":0.70}.
+
+    config APP_FACEAI_TRACK_HOLD_MS
+        int "F4 lightweight tracking: max ms to reuse the last decision (0 = off)"
+        range 0 2000
+        default 250
+        depends on APP_ENABLE_FACEAI
+        help
+            F4 轻跟踪节流（规划 P0-F4）：同一张脸（IoU 达标 + 中心位移小）在这个
+            毫秒窗口内**跳过 93ms 的 MFN 提特征**，沿用上一帧的比对结论，只更新人脸框。
+
+            ⚠️ 为什么必须有这个上限：完全静止的脸每帧都满足"IoU 达标 + 位移小"，
+            只看位移会一路跳过 → 提特征频率塌到接近 0、识别长时间不刷新。
+            150ms ≈ 上限 6.7 次/秒，正落在规划要的 5~10 次/秒；脸在动时位移超限
+            会立刻重算，所以"动"仍然每帧都提特征。0 = 关闭 F4（每帧都提，旧行为）。
+
+            ⚠️ 本值是**编译默认**，运行时可调：{"cmd":"mode","trk_hold_ms":400}（0~2000）。
+            实测（2026-10-06，PC 送图）AI 处理一帧约 244ms（解码+检测+提特征），
+            比 150ms 还长 → 150ms 时保持窗永远等不到触发（先有鸡先有蛋），必须现场扫。
+            ack 里的 trk=<ms>/iou<..>/sh<..>% 是**当前运行时值**。
+
+    config APP_FACEAI_TRACK_IOU
+        int "F4 track: min IoU with the previous identify box (%)"
+        range 10 90
+        default 40
+        depends on APP_ENABLE_FACEAI
+        help
+            与上一帧用于识别的脸框 IoU 高于此值才算"同一张脸"（默认 40%）。
+
+    config APP_FACEAI_TRACK_MOVE_PCT
+        int "F4 track: max face center shift (% of face width)"
+        range 1 100
+        default 10
+        depends on APP_ENABLE_FACEAI
+        help
+            中心位移超过脸宽的这个比例即认为"动得多"，立即重新提特征。
+
+    config APP_FACEAI_DIAG_DEEP
+        bool "Deep feature-extraction probes (slow, for non-determinism hunting)"
+        default n
+        depends on APP_ENABLE_FACEAI
+        help
+            ⚠️ 默认关。开启后匹配分支每帧会额外做「同帧重复查询 + 重复提特征」
+            （+93ms/帧，见 HANDOVER 廿一节）：目的只是把非确定性归因到查询侧/特征侧/
+            检测侧。**esp-dl 的模型执行是历史相关的，重复 run 本身就会污染后续帧的
+            特征**（真机实测：同一人同一站位同会话内 sim_raw 在 0.26~0.84 之间乱跳、
+            20 帧连一次 match 都到不了）——所以做阈值标定/识别质量评估时必须关掉。
+            结果帧字段：sim_q2 / sim_f2 / kp / ai_crc2（关掉后不再携带）。
+            轻量字段 frm_crc / ai_crc / dec_core / ai_core 常驻，不受本项影响。
+
+    config APP_FACEAI_DIAG_KP
+        bool "Report face keypoints in result frames (no side effects)"
+        default n
+        depends on APP_ENABLE_FACEAI
+        help
+            结果帧附带 "kp"（最大脸的 5 个关键点，10 个整数）。**不额外跑模型**，
+            所以开着也不会改变被测对象（对比 APP_FACEAI_DIAG_DEEP）。
+            用途：排查"同一张图自匹配却上不去 0.9"——看 kp 跨帧是否抖动，
+            抖动即 112x112 对齐错位（特征自匹配下降的直接证据）。
+            注意 kp 只在"本帧检到脸"的结果帧里出现。
 
     config APP_FACEAI_MAX_BOXES
         int "Max face boxes reported per result frame"
@@ -63,14 +160,99 @@ menu "JC P4 App Configuration"
         default 5
         depends on APP_ENABLE_FACEAI
 
+    config APP_FACEAI_EVENT_DEDUP_MS
+        int "F6 event dedup: same person's match / stable reject fires once per T ms (0 = off)"
+        range 0 600000
+        default 5000
+        depends on APP_ENABLE_FACEAI
+        help
+            F6 事件去重（规划 P1-F6，esp-box 门禁"识别成功欢迎一次"的语义）：
+            同一人的 match / 陌生人的稳定 reject 在 T 毫秒内只报一次事件，
+            窗口期内结果帧 event 回落为 "none"——但 match/sim/stable 字段照常
+            携带，UI 显示名字不闪断，host 侧联动（开门/日志）靠事件边沿触发。
+            运行时可调：{"cmd":"mode","dedup_ms":3000}（0 = 关闭去重）。
+
+    config APP_FACEAI_FAST_THR
+        int "F2 fast-confirm: single-frame sim >= this (%) confirms match without votes (0 = off)"
+        range 0 99
+        default 80
+        depends on APP_ENABLE_FACEAI
+        help
+            F2 快速通道（2026-10-06 晚）：本帧裸相似度 raw_sim >= 此值时不等
+            F2 窗口票数（M/M+1）直接确认 match——检出间歇时窗口凑不满票是
+            命中率真瓶颈（A 相位实测 53% 判定帧过 0.61 分数线、但票数规则
+            吃掉 8/10；离线复算加 0.80 快速通道后命中 2/19 -> 8/19）。
+            安全余量：真人陌生人 win-max 上沿 0.587、照片 B 上沿 0.189，
+            默认 0.80 对真人陌生人仍有 +0.21。0 = 关闭。
+            运行时可调：{"cmd":"mode","fast_thr":0.80}（0~1 浮点或 0~100）。
+
+    config APP_FACEAI_MULTI_MAX
+        int "F7 multi-face: extract & match top-N faces by area (1..3)"
+        range 1 3
+        default 2
+        depends on APP_ENABLE_FACEAI
+        help
+            F7 多人脸（规划 P1-F7）：按面积取前 N 张脸分别提特征比对。
+            第 1 大（主脸）走完整 F2/F4/F6 路径（顶层 match/sim 语义不变）；
+            其余的脸做裸比对（无平滑窗口，raw_sim >= thr_lo 才报名字）。
+            结果帧 boxes[i] 追加第 5/6 个元素 name/sim（旧解析只读前 4 个
+            坐标，向后兼容）。N=1 即旧行为。运行时 {"cmd":"mode","multi":N}。
+            ⚠️ 每多一张脸每帧多 ~93ms 提特征；F4 复用帧整帧跳过（含副脸）。
+
+    config APP_FACEAI_MAX_PERSONS
+        int "F9 max number of persons (unique names) in the face library"
+        range 1 256
+        default 64
+        depends on APP_ENABLE_FACEAI
+        help
+            F9 容量提升（2026-10-11）：名表里的唯一名字数上限（默认 64，原硬编码 10）。
+            名表已从 NVS 2048B 字符串迁移到 /storage/names.json，人数上限不再受
+            NVS 单值长度（~4000B）限制。达到上限后 register 回 "lib full"。
+            改本项后必须 idf.py reconfigure。
+
+    config APP_FACEAI_MAX_FEATS
+        int "F9 max feature rows in the name table (one row per enrolled feature)"
+        range 1 1024
+        default 320
+        depends on APP_ENABLE_FACEAI
+        help
+            F9：名表行数上限 = 可注册的特征总条数（一个名字多张特征 = 多行），
+            默认 320（≈64 人 × 5 张）。每条特征在 storage(FAT) 占约 2050B，
+            64×5 ≈ 0.65MB，8MB storage 分区充裕。RAM 名表约 320×36B ≈ 12KB。
+
+    config APP_FACEAI_NIGHT_OFF
+        bool "Low light = night vision only (no face recognition)"
+        default y
+        depends on APP_ENABLE_FACEAI
+        help
+            When the night ladder (APP_CAM_NIGHT_FPS) settles at tier 1/2,
+            the AI task stops consuming frames and skips face inference:
+            night vision preview (0x05) gets the frame pool exclusively and
+            results carry event="night" at 2Hz. Recognition resumes
+            automatically when luma returns to tier 0. PC-sourced frames
+            (src=pc) are never gated. Runtime override:
+            {"cmd":"cam","face_night":true|false}.
+
     config APP_ENABLE_WIFI
         bool "Enable Wi-Fi via ESP32-C6 (ESP-Hosted)"
         default y
         help
-            Currently the on-board C6 co-processor runs esp-hosted slave fw 2.3.2
-            while the host driver in this build is 3.0.7 -> "major version mismatch"
-            and wifi init never completes (main task spins, TWDT). Set to n to boot
-            without Wi-Fi (PC-as-HMI / USB-CDC pipeline does not need it).
+            2026-10-02 恢复：版本按厂商 wifi_scan 模板钉死（esp_wifi_remote
+            0.14.2 + esp_hosted 2.0.13，与出厂 C6 从机固件 2.3.2 配套，
+            见 HANDOVER 第十九节）。运行时 {"cmd":"wifi","ssid":X,"pass":Y}
+            配置凭据（NVS 保存）。
+
+    config APP_ENABLE_BLE
+        bool "Enable BLE via ESP32-C6 (NimBLE host on P4, VHCI over ESP-Hosted)"
+        default y
+        depends on APP_ENABLE_WIFI
+        help
+            BLE 5 peripheral on the co-processor: NimBLE host runs on the P4,
+            BT controller on the C6, HCI transported over the shared SDIO link
+            (esp-hosted VHCI). Advertises as "JC-P4" with a demo GATT service
+            (read/write/notify) for scanner-app verification. Requires the BT
+            block in sdkconfig (BT_ENABLED + controller disabled + NimBLE,
+            see sdkconfig.defaults 2026-10-04 section).
 
     config APP_CAM_WB_KR
         int "software WB red gain per-mille (1000 = off)"
@@ -89,6 +271,57 @@ menu "JC P4 App Configuration"
             因此在图像管道里对摄像头帧做行内镜像。运行时可用
             {"cmd":"cam","mirror":true|false} 切换。
 
+    config APP_CAM_PIPE_SLOTS
+        int "frame pool slots (imgpipe ring: AI + 0x05 preview share these)"
+        default 4
+        range 2 6
+        depends on APP_ENABLE_CAMERA
+        help
+            帧池槽数。**为什么不是 2（2026-10-06 实测）**：`pipe_take_slot()` 要求槽
+            既不是 latest 又不能 busy，而消费者（AI 识别）拿到一帧要占槽 ~190ms ——
+            2 槽时相机在这期间**无法发布**，池自身发布率被锁死在 ≈AI 消费率（实测
+            5.3fps，相机明明有 20fps）；0x05 预览流再进来和 AI **平分这 5.3 帧**，
+            于是两边都掉到 ~2.6fps（AI 帧率腰斩，预览也上不去）。
+            加到 4 槽后相机能在 AI 占槽时继续写空闲槽 → 池发布率回到相机帧率，
+            AI 与预览互不抢帧。每槽 ≈ stride×h（640x480 RGB565 ≈ 614KB，PSRAM 32MB）。
+            注意：PC 送图路径的槽按解码尺寸分配（最大 1920x1088x3 ≈ 6.3MB/槽）。
+
+    config APP_CAM_FRAME_CRC
+        bool "compute per-frame CRC32 of the whole frame (debug only, VERY expensive)"
+        default n
+        help
+            ⚠️ 默认关。开启后**每帧**对整帧（640x480 RGB565 = 614KB）做一次
+            `esp_rom_crc32_le`，实测 **18.5ms/帧**（2026-10-06 分段计时）——按 17~22 帧/s
+            算就是**单核约 30% 的 CPU 白烧**，直接压低整条管线（相机发布→AI/预览）的帧率。
+            它只服务结果帧里的 `frm_crc` / `ai_crc` 对照（查跨核缓存一致性的诊断，
+            见 HANDOVER 廿一节）；**一致性问题已由发布侧 `esp_cache_msync` 回写解决**，
+            所以平时关掉。要复查缓存一致性时再打开本项（并接受管线变慢）。
+
+    config APP_CAM_PUB_ON_DEMAND
+        bool "Publish camera frames only when a consumer is waiting (publish-on-demand)"
+        default y
+        depends on APP_ENABLE_CAMERA
+        help
+            发布端按需发布（2026-10-06 待办 5）：相机 50fps 每帧都做 614KB 拷贝
+            （copy ~8.6ms）+ 白平衡/镜像一次遍历（post ~8.3ms），但消费者实际只取
+            ~7（AI）+10（预览）帧/s —— **CPU1 约 87% 花在没人要的帧上**。
+            开启后：没有消费者在 get_frame 里等待、且距上次发布不足 MIN_MS 时，
+            直接跳过整条 copy/AE/DN/post 链（帧在源头丢弃，计入 pub_skip）。
+            ⚠️ 仍保证每 PUB_MIN_MS 至少发布一帧：AE 亮度采样 / 运动估计 / 时域
+            降噪都挂在发布路径上，全跳过会让夜视阶梯与 AE 失去输入（luma 冻结）。
+            运行时开关：{"cmd":"cam","pub_demand":true|false}（A/B 对比用），
+            效果看每秒日志 imgpipe/prof 的 pub[...] 帧数 n 与 skip 计数。
+
+    config APP_CAM_PUB_MIN_MS
+        int "publish-on-demand: forced minimum publish interval (ms)"
+        range 20 1000
+        default 100
+        depends on APP_ENABLE_CAMERA
+        help
+            按需发布模式下的强制发布下限（默认 100ms = 至少 10 帧/s）：
+            AE 采样节流 250ms、AUTO 运动探测窗 300ms，10 帧/s 足够喂饱全部
+            判定状态机；再调小会侵蚀按需发布省下的 CPU。
+
     config APP_CAM_DN
         int "temporal denoise level at boot (0=off 1=low 2=mid 3=high)"
         default 0
@@ -106,6 +339,112 @@ menu "JC P4 App Configuration"
             camera 任务(prio 6)拖垮（历史踩过 task_wdt 的坑）。夜视档（10fps）
             会正常启用；默认 25 意味着 50fps 档位不降噪。
 
+    config APP_CAM_MOTION_THR
+        int "motion block threshold (G-channel diff 0..63) for auto-fps"
+        default 30
+        range 1 63
+        help
+            运动估计判定用：8x8 块内"最大 G 通道差"达到此值即算该块在动
+            （静止噪声实测块最大差多在 13~20，取 30 有足够余量）。调小更灵敏、
+            调大更迟钝。运行时可用 {"cmd":"cam","mv_thr":N} 标定。
+
+    config APP_CAM_MOTION_RATIO
+        int "motion block ratio percent to trigger auto-fps active mode"
+        default 5
+        range 1 100
+        help
+            自动帧率模式下，运动块占比达到此百分比即判定"画面在动"，
+            切到 APP_CAM_AUTO_ACTIVE_FPS；低于它并持续一段时间则回落。
+
+    config APP_CAM_AUTO_ACTIVE_FPS
+        int "auto-fps active frame rate (motion detected / daytime fixed rate)"
+        default 50
+
+    config APP_CAM_DAY_STEP
+        bool "Day: step fps down when AE runs out of exposure headroom"
+        default y
+        depends on APP_CAM_NIGHT_FPS
+        help
+            白天曝光余量阶梯（常规相机的自动快门，非夜视逻辑）：
+            AE 的 exp 顶满上限且增益达到 DAY_GAIN_GATE、持续数秒 -> 50fps 降到
+            DAY_FPS_MID（20fps，帧周期 50ms=5x10ms 与 50Hz 抗频闪对齐，曝光上限
+            2.5 倍）；仍不足再降到 DAY_FPS_LOW（10fps）。exp 余量恢复后自动回 50。
+            只在夜视阶梯 tier0（白天侧）+ AE 开启时生效；手动 fps 让位（关阶梯）。
+            夜视档（tier1/2 -> 5fps）与运动自适应完全不受影响。
+
+    config APP_CAM_DAY_FPS_MID
+        int "day exposure-ladder middle fps (20 aligns 50Hz flicker)"
+        default 20
+        range 5 45
+        depends on APP_CAM_DAY_STEP
+
+    config APP_CAM_DAY_FPS_LOW
+        int "day exposure-ladder lowest fps"
+        default 10
+        range 3 45
+        depends on APP_CAM_DAY_STEP
+
+    config APP_CAM_DAY_GAIN_GATE
+        int "gain index marking 50fps exposure-starved (0..192)"
+        default 48
+        range 8 192
+        depends on APP_CAM_DAY_STEP
+        help
+            exp 顶满时增益仍超过此值 = 50fps 进光不足（画面靠增益硬提，噪点大），
+            触发降档。实测本房间暗时增益 70~140、亮时 0~20，取 48 为界。
+
+    config APP_CAM_NIGHT_FPS
+        bool "Night ladder: drop frame rate automatically when the scene goes dark"
+        default y
+        depends on APP_ENABLE_CAMERA
+        help
+            #1 暗度驱动的降帧率（默认常开，不需要用户按 AUTO）：
+            帧内亮度低于阈值并持续一段时间后自动把帧率降档，曝光上限随 VTS 变大
+            （15fps -> 5fps -> 2fps，曝光上限 66ms -> 200ms -> 500ms），画面变亮或
+            出现运动时自动回升。手动 {"cmd":"cam","fps":N} 会让它让位，
+            {"cmd":"cam","night":true} 可重新打开。结果帧带 night/ntier。
+
+    config APP_CAM_NIGHT_FPS_LOW
+        int "night ladder tier-1 frame rate (dark)"
+        default 5
+        range 1 50
+
+    config APP_CAM_NIGHT_FPS_MIN
+        int "night ladder tier-2 frame rate (darkest)"
+        default 5
+        range 1 50
+        help
+            默认 5 而不是更低的 2：帧率越低，AUTO 检测到运动并升档的延迟越大
+            （延迟 ≈ 1 个帧周期用于识别 + 1 个帧周期用于把写请求排进 camera 任务）。
+            2fps 实测帧周期 ~0.95s → 端到端约 2~3s，5fps 约 0.8s。
+            想要极限进光量（2fps 约多 1.6 倍光）可以调回 2，代价就是那个延迟。
+
+    config APP_CAM_NIGHT_LUMA_DARK
+        int "night ladder: luma below this = dark (tier 1)"
+        default 45
+        range 1 200
+        help
+            与夜视增强的 ENH_LUMA_DARK 同口径。进入档位用本值，退出档位用
+            "本值 + 迟滞带"（代码里的 NIGHT_LUMA_HYST），避免阈值边缘抖动。
+
+    config APP_CAM_NIGHT_LUMA_DARKER
+        int "night ladder: luma below this = darkest (tier 2)"
+        default 25
+        range 1 200
+
+    config APP_CAM_NIGHT_DN_LOW
+        int "auto temporal denoise level in night tier 1 (0..3, 0 = leave manual value)"
+        default 2
+        range 0 3
+
+    config APP_CAM_NIGHT_DN_MIN
+        int "auto temporal denoise level in night tier 2 (0..3, 0 = leave manual value)"
+        default 3
+        range 0 3
+        help
+            #2 夜视档自动开时域降噪：长曝光下画面被噪声主导（实测 DN=3 能把噪声汤
+            变成可看画面）。手动 {"cmd":"cam","dn":N} 后自动 DN 让位。
+
     config APP_CAM_DEF_GAIN
         int "Camera default gain index (SC2336: 0..192; 72 = indoor normal)"
         default 72
@@ -113,6 +452,104 @@ menu "JC P4 App Configuration"
             esp_video 的 AE/AGC 在当前配置下不会调增益（实测恒为 0 = 最小），
             而 SC2336 的增益范围是 0..192。不设默认值的话夜景就是一片黑
             (avg_luma≈30)。PC/UI 可以用 {"cmd":"cam","gain":N} 随时改。
+
+    config APP_CAM_CORE
+        int "CPU core for the camera capture task (0/1)"
+        default 1
+        range 0 1
+        help
+            camera 任务每帧 600KB 拷贝+后处理约占 15~24ms CPU。与 AI 推理同挤
+            CPU0 时会互相饿死（实测：AI 模型加载卡死、IDLE0 触发 WDT）。钉到
+            CPU1 后采集/后处理与 AI 各占一核。
+
+    config APP_CAM_AE
+        bool "Auto exposure (app-level closed loop, app_camauto)"
+        default y
+        depends on APP_ENABLE_CAMERA
+        help
+            app 级自动曝光：imgpipe 帧内稀疏亮度采样 -> 目标亮度闭环 ->
+            先调曝光后调增益（写操作走 camera 任务信箱串行执行）。
+            IPA pipeline controller 已关闭（闭源库实测不抬增益且会覆盖手动值）。
+            任何手动 exp/gain/fps 操作都会自动退出 AE。
+
+    config APP_CAM_AE_TARGET
+        int "AE target luma (0..255, Rec.601)"
+        default 120
+        range 20 240
+        help
+            自动曝光收敛目标。实测参考：gain72/exp519 室内 avg≈120。
+            运行时可用 {"cmd":"cam","ae_target":N} 调。
+
+    config APP_CAM_AE_FLICKER50
+        bool "AE anti-flicker: quantize exposure to 10ms steps (50Hz mains)"
+        default y
+        depends on APP_CAM_AE
+        help
+            市电照明下曝光取 10ms（500 行，SC2336 行时间 20µs）整数倍可避免
+            画面滚动暗带。代价是曝光粒度变粗（细调由增益承担）。
+
+    config APP_CAM_AE_EXP_MAX_MS
+        int "AE exposure cap in ms (0 = uncapped, fps-tier maximum)"
+        range 0 1000
+        default 40
+        depends on APP_CAM_AE
+        help
+            AE 曝光上限（毫秒）：暗光下 AE 不再把积分拉满帧周期，超过上限就
+            转为提增益——宁可画面暗一点、噪一点，保住锐度。依据（2026-10-06
+            晚统一 A 相实测）：100ms 长积分轮的 win-max median 只有 0.638，
+            20ms 锐利轮到 0.753（模糊帧毁掉检测与特征，锐利的噪声图优于模糊
+            的干净图）；快速通道随特征质量生效（命中 20% -> 36%）。
+            行数换算：1ms = 50 行（exp_max = 1000*50/fps - 6 同一口径）。
+            ⚠️ 只作用于人脸路径（夜视档 tier>=1 时自动解除——夜视要亮度，
+            且那时人脸识别已门控关闭）。运行时 {"cmd":"cam","ae_exp_max_ms":N}
+            （0 = 解除上限）。白天曝光阶梯在积分触到上限后自然停步
+            （50->20fps 仍会发生，20->10 不再发生——上限之下降帧率不换来亮度）。
+
+    config APP_CAM_AWB
+        bool "Auto white balance (gray-world -> software WB, app_camauto)"
+        default y
+        depends on APP_ENABLE_CAMERA
+        help
+            app 级自动白平衡：量 WB 前的 R/G/B 通道均值，灰世界算 kr/kb，
+            EMA 平滑 + 死区后写入现有软件白平衡（纯变量，零阻塞）。
+            手动 wb_kr/wb_kb 操作会自动退出 AWB。
+
+    config APP_CAM_AWB_MIN_LUMA
+        int "Skip AWB below this luma (dark frames unreliable)"
+        default 40
+        range 0 200
+        help
+            亮度低于此值时通道均值被噪声主导，灰世界会算歪，跳过校正保持现状。
+
+    config APP_CAM_CCM_MIX
+        int "CCM color-correction mix (permille of vendor calibration)"
+        default 1000
+        range 0 1500
+        help
+            ISP 硬件 CCM：IPA 控制器关闭后厂商标定矩阵（sc2336_default.json
+            acc/ccm，行和 1.0 亮度守恒）从未下发，是白天颜色与人眼差距大的
+            主要软件来源。1000 = 完整标定矩阵（默认）；0 = 禁用 CCM 模块；
+            >1000 向过饱和方向外插（厂商另标了 saturation 138，可试 1380）。
+            运行时 {"cmd":"cam","ccm_mix":N} 可调，结果帧带 "ccm" 字段。
+
+    config APP_CAM_NIGHT_ENH
+        bool "Night enhancement: adaptive ISP gamma lift + BF denoise (app_camauto)"
+        default y
+        depends on APP_ENABLE_CAMERA
+        help
+            自适应夜视增强：关掉 IPA 控制器后 ISP 的低光增强（gamma 暗部提亮
+            0.688、BF 拜耳降噪 level 3~7）全部消失、画面发暗发灰噪点重——本项在
+            app 层恢复：gamma 随实测亮度自适应（亮时线性无感、暗时加强），
+            BF 随增益分档（对齐 IPA 的 adn 表）。经 /dev/video20 写 ISP 硬件，
+            零 CPU。手动 gamma/bf_level 命令会让自适应让位。
+
+    config APP_CAM_GAMMA_MIN
+        int "Strongest night gamma param (permille, 650 ~= IPA's 0.688)"
+        default 650
+        range 300 1000
+        help
+            最暗时的 gamma 参数（千分比）：650 与 IPA 调优值 0.688 同量级。
+            越小暗部提亮越强，过小（<400）会丢暗部层次。
 
     config APP_ENABLE_STREAM
         bool "Enable image stream back to PC (JCLINK 0x05, hw JPEG encode)"

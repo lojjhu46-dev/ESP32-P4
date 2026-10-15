@@ -3,6 +3,8 @@
  */
 #include <string.h>
 #include <errno.h>
+#include <fcntl.h>
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -34,16 +36,37 @@ static esp_err_t tcp_write(const uint8_t *data, uint32_t len)
     if (fd < 0) {
         return ESP_ERR_INVALID_STATE;
     }
+    /* 非阻塞发送 + 整帧完成循环：
+     *  - 调用者是 faceai/imgpipe/stream 任务，绝不能像最初那样用阻塞 send 死等
+     *    慢客户端（实测 WSL NAT 链路把 AI 拖到 5fps）；
+     *  - 但**帧一旦开始发送就不能中途放弃**：TCP 没有回滚，半截帧会把整个字节流
+     *    撕裂（接收端只能靠 CRC 丢帧重同步）。lwip 默认发送缓冲只有 ~5.7KB，
+     *    而一帧 0x05 JPEG 有 10~20KB，非阻塞 send 必然只发出一半——实测画面
+     *    一张都到不了。现在配合 CONFIG_LWIP_TCP_SND_BUF_DEFAULT=32768：
+     *    缓冲有整帧空间时一次 send 完成（常态）；缓冲不足时短暂重试等排水，
+     *    总超时后放弃（此时已发出的部分会撕裂，由接收端 CRC 挡掉——仅发生在
+     *    客户端严重过慢的场景，优于把发送任务卡死）。 */
     xSemaphoreTake(s_tx_lock, portMAX_DELAY);
     uint32_t off = 0;
     esp_err_t err = ESP_OK;
+    int64_t t0 = esp_timer_get_time();
     while (off < len) {
         int n = send(fd, data + off, len - off, 0);
-        if (n <= 0) {
-            err = ESP_FAIL;
-            break;
+        if (n > 0) {
+            off += (uint32_t)n;
+            continue;
         }
-        off += (uint32_t)n;
+        if ((errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) &&
+            esp_timer_get_time() - t0 < 500000) {      /* 总预算 500ms（raw 帧 614KB 在
+                                                          100M 链路需要 ~60-90ms，100ms
+                                                          预算下 raw 模式整帧必然超时放弃）*/
+            xSemaphoreGive(s_tx_lock);
+            vTaskDelay(1);                             /* 等客户端排水（1 tick） */
+            xSemaphoreTake(s_tx_lock, portMAX_DELAY);
+            continue;
+        }
+        err = (errno == EAGAIN || errno == EWOULDBLOCK) ? ESP_ERR_NO_MEM : ESP_FAIL;
+        break;
     }
     xSemaphoreGive(s_tx_lock);
     return err;
@@ -67,6 +90,12 @@ static void netlink_serve(int fd, const char *peer_ip)
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
     setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+    /* 非阻塞 socket：发送路径（tcp_write）满缓冲时丢帧不阻塞；recv 得自己处理
+       EAGAIN（下面加 1 tick 延时避免空转） */
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) {
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    }
 
     s_client = fd;
     app_usb_link_set_transport(&s_tcp_tp);
@@ -86,6 +115,7 @@ static void netlink_serve(int fd, const char *peer_ip)
             break;
         }
         if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+            vTaskDelay(1);               /* 非阻塞 socket 无数据：让出 CPU */
             continue;
         }
         ESP_LOGW(TAG, "recv error %d on client %s", errno, peer_ip);

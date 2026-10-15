@@ -18,8 +18,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import struct
 import sys
 import time
+import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from protocol import Link  # noqa: E402
@@ -44,6 +46,97 @@ def send_frames(link: Link, files: list[str], timeout: float = 15.0) -> None:
         show(obj, prefix=f"<- {os.path.basename(f)} {len(jpeg)}B")
         if obj is not None:
             print(f"   wall {1000 * (time.monotonic() - t0):.0f} ms, board infer_ms={obj.get('infer_ms')}")
+
+
+# ---------------- F10：特征库备份 / 恢复 ----------------
+# 备份信封（与板端 app_faceai.cpp 逐字节一致）：
+#   magic "JCDF"(4) | ver u32 | face_len u32 | names_len u32 | names(JSON) | face.db
+# 传输：0x06 分片，payload = offset(u32 LE) + data
+DBX_MAGIC = 0x4644434A          # "JCDF"
+DBX_VER = 1
+DBX_HDR = 16
+DBX_CHUNK = 16 * 1024
+
+
+def db_backup(link: Link, path: str) -> bool:
+    """db_export → 收齐 0x06 分片 → CRC32 校验 → 落盘 .bin"""
+    ack = link.cmd_and_wait({"cmd": "db_export"}, timeout=20.0)
+    if ack is None or "dbx" not in ack:
+        print("<- db_export 失败（板端未返回 dbx 字段）")
+        return False
+    dbx = ack["dbx"]
+    size, crc, parts = int(dbx["size"]), int(dbx["crc"]), int(dbx["parts"])
+    print(f"<- db_export: {size} B / {parts} part(s) crc={crc:08x}")
+
+    buf = bytearray(size)
+    seen: set[int] = set()
+    got = 0
+    deadline = time.monotonic() + 60.0
+    while got < size and time.monotonic() < deadline:
+        blk = link.recv_block(timeout=2.0)
+        if blk is None:
+            continue
+        off, data = blk
+        if off in seen:
+            continue
+        if off + len(data) > size:
+            print(f"! 分片越界 off={off} len={len(data)} (size={size})")
+            return False
+        seen.add(off)
+        buf[off:off + len(data)] = data
+        got += len(data)
+    if got != size:
+        print(f"! 分片不齐: {got}/{size}")
+        return False
+
+    calc = zlib.crc32(bytes(buf)) & 0xFFFFFFFF
+    if calc != crc:
+        print(f"! CRC 不符: 板端 {crc:08x} / 本地 {calc:08x}")
+        return False
+
+    with open(path, "wb") as fp:
+        fp.write(buf)
+    magic, ver, face_len, names_len = struct.unpack_from("<IIII", buf, 0)
+    names = []
+    if names_len:
+        try:
+            names = json.loads(bytes(buf[DBX_HDR:DBX_HDR + names_len]).decode("utf-8", "replace"))
+        except ValueError:
+            names = []
+    who = ", ".join(n.get("name", "?") for n in names) if names else "(空)"
+    print(f"<- 已保存 {path}: {len(buf)} B, face.db {face_len} B, {len(names)} person(s): {who}")
+    return True
+
+
+def db_restore(link: Link, path: str) -> bool:
+    """读 .bin → db_import → 分片回传 → db_import_end（覆盖式恢复）"""
+    with open(path, "rb") as fp:
+        data = fp.read()
+    if len(data) < DBX_HDR:
+        print("! 文件太小，不是备份文件")
+        return False
+    magic, ver, face_len, names_len = struct.unpack_from("<IIII", data, 0)
+    if magic != DBX_MAGIC or ver != DBX_VER:
+        print(f"! 信封格式不符 (magic=0x{magic:08x} ver={ver})")
+        return False
+    crc = zlib.crc32(data) & 0xFFFFFFFF
+
+    ack = link.cmd_and_wait({"cmd": "db_import", "size": len(data), "crc": crc}, timeout=20.0)
+    if ack is None or ack.get("event") == "error":
+        print(f"<- db_import 被拒绝: {ack}")
+        return False
+    print(f"<- db_import ready ({len(data)} B, crc={crc:08x})")
+
+    n = 0
+    for off in range(0, len(data), DBX_CHUNK):
+        link.send_block(off, data[off:off + DBX_CHUNK])
+        n += 1
+        time.sleep(0.002)       # 小睡：给板端 rx 环留喘息，别挤掉在途命令帧
+    print(f"-> 已发送 {n} 块")
+
+    ack = link.cmd_and_wait({"cmd": "db_import_end"}, timeout=30.0)
+    show(ack)
+    return ack is not None and ack.get("event") != "error"
 
 
 def main() -> int:
@@ -99,6 +192,11 @@ def main() -> int:
 
     p_cmd = sub.add_parser("cmd", help="发一条原始 JSON 命令并等 ack")
     p_cmd.add_argument("json", help='例如 \'{"cmd":"cam","gain":8}\'')
+
+    p_dbb = sub.add_parser("db_backup", help="F10：导出特征库+名表到 .bin（0x06 分片）")
+    p_dbb.add_argument("out", nargs="?", default="face_db_backup.bin")
+    p_dbr = sub.add_parser("db_restore", help="F10：从 .bin 覆盖恢复（导入前板端自动 .bak）")
+    p_dbr.add_argument("file")
 
     p_demo = sub.add_parser("demo")
     p_demo.add_argument("face_dir", help="含 bill1.jpg/bill2.jpg/musk1.jpg/musk2.jpg 的目录")
@@ -232,6 +330,10 @@ def main() -> int:
             show(link.cmd_and_wait(json.loads(args.json)))
         elif args.cmd == "delete":
             show(link.cmd_and_wait({"cmd": "delete", "id": args.name}))
+        elif args.cmd == "db_backup":
+            print("# db_backup", "OK" if db_backup(link, args.out) else "FAILED")
+        elif args.cmd == "db_restore":
+            print("# db_restore", "OK" if db_restore(link, args.file) else "FAILED")
         elif args.cmd == "demo":
             d = args.face_dir
             show(link.cmd_and_wait({"cmd": "clear"}))

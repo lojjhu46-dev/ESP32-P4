@@ -13,6 +13,8 @@
 #include "esp_check.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
+#include "esp_cache.h"
+#include "esp_rom_crc.h"
 #include "driver/jpeg_decode.h"
 
 #include "app_imgpipe.h"
@@ -24,7 +26,22 @@
 #define TAG "imgpipe"
 
 #define PIPE_RX_BUF        (256 * 1024)   /* JPEG 接收缓冲（PSRAM） */
-#define PIPE_SLOTS         2              /* 帧池槽数（双缓冲） */
+/* 帧池槽数（Kconfig，默认 4）。⚠️ 不要改回 2：`pipe_take_slot()` 要求槽既不是
+ * latest 又不能 busy，而 AI 拿到一帧要占槽 ~190ms —— 2 槽时相机在这期间无法发布，
+ * 池发布率被锁死在 ≈AI 消费率（实测 5.3fps，相机有 20fps）；0x05 预览流再进来和
+ * AI 平分这 5.3 帧 → 两边都掉到 ~2.6fps（2026-10-06 实测，见 HANDOVER 第廿一节）。*/
+#ifndef CONFIG_APP_CAM_PIPE_SLOTS
+#define CONFIG_APP_CAM_PIPE_SLOTS 4
+#endif
+#define PIPE_SLOTS         CONFIG_APP_CAM_PIPE_SLOTS
+/* 发布端按需发布（Kconfig APP_CAM_PUB_ON_DEMAND / APP_CAM_PUB_MIN_MS）：
+ * bool=n 时 sdkconfig.h 不生成宏，兜底为 0（关闭）——改 Kconfig 后必须 reconfigure */
+#ifndef CONFIG_APP_CAM_PUB_ON_DEMAND
+#define CONFIG_APP_CAM_PUB_ON_DEMAND 0
+#endif
+#ifndef CONFIG_APP_CAM_PUB_MIN_MS
+#define CONFIG_APP_CAM_PUB_MIN_MS 100
+#endif
 #define PIPE_TASK_STACK    4096
 #define PIPE_TASK_PRIO     5
 #define PIPE_ACQ_TIMEOUT   200            /* 源取帧超时 ms */
@@ -60,6 +77,18 @@ static struct {
     int               prev_stride, prev_h;
     bool              has_prev;   /* prev 是否可用（首帧/失效后为 false） */
                                   /* 降噪耗时统计见 s_pipe.st.dn_ms */
+    /* 运动估计（自动帧率用，与降噪解耦）*/
+    bool              mv_on;      /* 开：每帧估计运动（自动模式）*/
+    int               mv_thr;     /* 块运动阈值（G 通道差）*/
+    uint8_t          *mv_prev;    /* 上一帧原始内容（每帧无条件刷新）*/
+    size_t            mv_prev_cap;
+    int               mv_prev_stride, mv_prev_h;
+    bool              mv_has_prev;
+    bool              ae_stats_on;  /* AE/AWB 统计采样开关（app_camauto 用）*/
+    /* 发布端按需发布：没有消费者等帧且未到强制间隔时，相机帧整条链路跳过 */
+    bool              pub_demand;
+    int64_t           last_pub_us;  /* 上次真实发布的时刻（强制下限计时用）*/
+    volatile int      waiters;      /* 正在 get_frame 里等帧的消费者数（启发式，无需加锁）*/
     app_imgpipe_sink_t sink;
     bool              auto_ack;
     bool              ready;
@@ -67,6 +96,27 @@ static struct {
     int64_t           fps_win;
     uint32_t          fps_cnt;
 } s_pipe;
+
+/* ---- 分段性能计数（诊断，每秒清零）----------------------------------------
+ * 目的：找出"相机→帧池"每帧约 59ms 固定开销花在哪（2026-10-06 实测：cam50 时
+ * AI 结果帧率 17/s，而检测只需 18ms → 每帧 ~59ms 开销压在管线里）。
+ * 发布侧跑在 camera 任务（CPU1），消费侧失效跑在消费者核（CPU0）。          */
+static struct {
+    uint32_t copy_us;    /* 槽内 memcpy（= frame.dec_ms，这里累计便于算均值）*/
+    uint32_t ae_us;      /* AE/AWB 统计全帧扫描 */
+    uint32_t dn_us;      /* 时域降噪 */
+    uint32_t post_us;    /* 白平衡 + 行内镜像（一次遍历 307200 像素）*/
+    uint32_t crc_us;     /* 逐帧 CRC32 全帧扫描（诊断字段用，非必需）*/
+    uint32_t msync_us;   /* 发布侧 C2M 回写（614KB）*/
+    uint32_t inv_us;     /* 消费侧 M2C 失效累计 us */
+    uint32_t inv_max;    /* 单次 M2C 失效最大 us */
+    uint32_t inv_n;      /* 失效次数 */
+    uint64_t inv_bytes;  /* 失效字节总量（算等效带宽）*/
+    uint64_t lat_us;     /* "发布 → 被消费者取走"排队延迟累计 us */
+    uint32_t lat_max_ms; /* 最大排队延迟 ms */
+    uint32_t lat_n;
+    uint32_t skip_n;     /* 按需发布跳过的帧数（本统计窗口） */
+} s_prof;
 
 /* ---------------- USB (JCLINK) 图像源 ---------------- */
 
@@ -204,6 +254,11 @@ static esp_err_t pipe_decode_into(int idx, const uint8_t *jpeg, uint32_t len)
     sl->frame.fmt = IMG_FMT_RGB888;
     sl->frame.dec_ms = (uint32_t)((esp_timer_get_time() - t0) / 1000);
     sl->frame.seq = s_pipe.st.rx_frames;
+    /* 诊断：生产者侧像素指纹 + 所在核。CRC 读取发生在驱动 invalidate 同核，
+     * 反映 DMA 真实输出；消费者读到的内容是否一致由 ai_crc 对照判读 */
+    sl->frame.crc32 = esp_rom_crc32_le(0, sl->frame.data,
+                                       (size_t)sl->frame.stride * sl->frame.height);
+    sl->frame.dec_core = (int)xPortGetCoreID();
     return ESP_OK;
 }
 
@@ -217,9 +272,12 @@ static esp_err_t pipe_decode_into(int idx, const uint8_t *jpeg, uint32_t len)
  * 互不相关、场景内容高度相关 —— 对"没动的地方"做多帧加权平均，噪声按 √N 下降。
  *
  * 做法（性能红线：camera 任务 prio 6，逐像素乘除会触发 task_wdt，历史踩过）：
- *   - 16x16 分块，每块用"下采样 SAD"（4x4=16 个采样点的 G 通道差）判断运动强度
- *   - 静止块强混合、运动块减弱或跳过（避免拖影）
- *   - 像素混合用整数移位：out = cur + ((prev - cur) * wq) >> 8，每像素 1 次乘法
+ *   - 8x8 分块（2026-10-01 由 16x16 改小：块太大时局部小运动会被块内均值稀释掉）
+ *   - 每块取 4x4=16 个采样点，用**块内最大差**（G 通道 6bit，0..63）判运动 ——
+ *     用最大差而不是均值：块里只要有一小片在动就必须判为运动，否则会留半透明拖影
+ *   - 静止块强混合、运动块减弱或**完全跳过**；跳过的块把当前帧刷进 prev，
+ *     否则旧影像会"冻"在历史里、等运动停下再混回来形成闪回
+ *   - 像素混合用整数移位：out = cur + ((prev - cur) * wq) >> 8
  *     （ESP32 硬件乘法 1 周期；全程无除法/浮点），混合结果同时写回 prev（IIR，
  *     等效多帧平均，省掉一次 600KB memcpy）
  *   - dn=0 时完全不进这里（零开销）；高帧率由守卫跳过（CONFIG_APP_CAM_DN_MAX_FPS）
@@ -227,20 +285,20 @@ static esp_err_t pipe_decode_into(int idx, const uint8_t *jpeg, uint32_t len)
  * ⚠️ 必须在镜像之前调用：prev 始终保存"未镜像"内容，否则 cur/prev 左右错位会出鬼影。
  */
 
-#define DN_BLOCK     16      /* 块边长 */
-#define DN_SAD_STEP  4       /* SAD 采样步长（每块 4x4=16 点） */
+#define DN_BLOCK     8       /* 块边长（越小小运动越不容易被漏判） */
+#define DN_SAD_STEP  2       /* 采样步长（8x8 块取 4x4=16 点） */
 
-/* 档位参数：wq = 静止块混合权重（0..256，越大越依赖历史）；sad_lo/hi = 运动门限
- * （G 通道 6bit 差的采样均值：<=lo 全混、>=hi 不混，中间线性衰减） */
+/* 档位参数：wq = 静止块混合权重（0..256，越大越依赖历史）；mmax_lo/hi = 运动门限
+ * （块内**最大** G 通道差：<=lo 全混、>=hi 不混并跳过，中间线性衰减） */
 static const struct {
     int wq;
-    int sad_lo;
-    int sad_hi;
+    int mmax_lo;
+    int mmax_hi;
 } s_dn_tab[4] = {
     {   0,   0,   0 },       /* 0 = 关（不会走到这里） */
-    { 128,   6,  18 },       /* 1 = 低：静止块混 50% */
-    { 192,   8,  24 },       /* 2 = 中：混 75% */
-    { 236,  10,  30 },       /* 3 = 高：混 92%（留 8% 新帧，避免画面"冻住"） */
+    { 128,  14,  28 },       /* 1 = 低：静止块混 50% */
+    { 192,  16,  32 },       /* 2 = 中：混 75% */
+    { 236,  18,  38 },       /* 3 = 高：混 92%（留 8% 新帧，避免画面"冻住"） */
 };
 
 /* 按当前尺寸准备 prev 缓冲（沿用槽的 cap/stride/h 失效键思路） */
@@ -281,47 +339,64 @@ static void pipe_dn_apply(uint8_t *data, int w, int h, int stride)
     }
 
     const int wq0 = s_dn_tab[s_pipe.dn].wq;
-    const int sad_lo = s_dn_tab[s_pipe.dn].sad_lo;
-    const int sad_hi = s_dn_tab[s_pipe.dn].sad_hi;
-    uint32_t nblk = 0, nsad = 0, ntot = 0;
+    const int mmax_lo = s_dn_tab[s_pipe.dn].mmax_lo;
+    const int mmax_hi = s_dn_tab[s_pipe.dn].mmax_hi;
+    uint32_t nblk = 0, nmv = 0, nsum_sad = 0, nsum_max = 0, ntot = 0;
 
     for (int y0 = 0; y0 < h; y0 += DN_BLOCK) {
         int bh = (h - y0 < DN_BLOCK) ? (h - y0) : DN_BLOCK;
         for (int x0 = 0; x0 < w; x0 += DN_BLOCK) {
             int bw = (w - x0 < DN_BLOCK) ? (w - x0) : DN_BLOCK;
 
-            /* 块 SAD（下采样、只看 G 通道，均值尺度 0..63） */
-            int sad = 0;
+            /* 块内运动判定：采样点的 G 通道差，同时取均值（旧口径）和最大值（新判据）*/
+            int sum = 0, mmax = 0, nsmp = 0;
             for (int by = 0; by < bh; by += DN_SAD_STEP) {
                 const uint16_t *pc = (const uint16_t *)(data + (size_t)(y0 + by) * stride) + x0;
                 const uint16_t *pp = (const uint16_t *)(s_pipe.prev + (size_t)(y0 + by) * stride) + x0;
                 for (int bx = 0; bx < bw; bx += DN_SAD_STEP) {
                     int d = (int)((pc[bx] >> 5) & 0x3F) - (int)((pp[bx] >> 5) & 0x3F);
-                    sad += d < 0 ? -d : d;
+                    if (d < 0) d = -d;
+                    sum += d;
+                    if (d > mmax) mmax = d;
+                    nsmp++;
                 }
             }
-            sad >>= 4;
-            nsad += (uint32_t)sad;
+            if (nsmp == 0) {
+                continue;                         /* 尺寸退化导致的空块（理论上不会）*/
+            }
             ntot++;
+            nsum_sad += (uint32_t)(sum / nsmp);
+            nsum_max += (uint32_t)mmax;
 
             int wq = wq0;
-            if (sad >= sad_hi) {
-                wq = 0;                           /* 运动块：保留新帧（无拖影） */
-            } else if (sad > sad_lo) {
-                wq = wq0 * (sad_hi - sad) / (sad_hi - sad_lo);   /* 块级除法，每块仅一次 */
+            if (mmax >= mmax_hi) {
+                wq = 0;                           /* 运动块：完全不混，整块保留当前帧 */
+            } else if (mmax > mmax_lo) {
+                wq = wq0 * (mmax_hi - mmax) / (mmax_hi - mmax_lo);   /* 块级除法，每块一次 */
             }
+
             if (wq <= 0) {
+                /* 运动块：不混合，但必须把当前帧刷进 prev —— 否则残影会"冻"在历史里，
+                   等物体停下（差值落回阈值以下）再被混回画面，就成了"画面滞留" */
+                nmv++;
+                for (int y = 0; y < bh; y++) {
+                    uint16_t *pc = (uint16_t *)(data + (size_t)(y0 + y) * stride) + x0;
+                    uint16_t *pp = (uint16_t *)(s_pipe.prev + (size_t)(y0 + y) * stride) + x0;
+                    memcpy(pp, pc, (size_t)bw * 2);
+                }
                 continue;
+            }
+            if (wq < wq0) {
+                nmv++;                            /* 权重被减弱的块也算"运动"（UI 显示用）*/
             }
             nblk++;
 
-            /* 像素混合：整包 16bit 线性插值（RGB565 分量间最多 ±1 LSB 串位，肉眼不可见） */
+            /* 像素混合：**按 R/G/B 分量分别**做整数插值
+               （⚠️ 不能对 RGB565 整包插值：位打包会跨分量借位，实测噪声反涨 2.6 倍）*/
             for (int y = 0; y < bh; y++) {
                 uint16_t *pc = (uint16_t *)(data + (size_t)(y0 + y) * stride) + x0;
                 uint16_t *pp = (uint16_t *)(s_pipe.prev + (size_t)(y0 + y) * stride) + x0;
                 for (int x = 0; x < bw; x++) {
-                    /* ⚠️ 必须按 R/G/B 分量分别混合：RGB565 是位打包格式，
-                       对整包做线性插值会跨分量借位（实测噪声反而涨 2.6 倍、出彩色伪影） */
                     int c = pc[x];
                     int p = pp[x];
                     int r = (c >> 11) & 0x1F;
@@ -338,8 +413,149 @@ static void pipe_dn_apply(uint8_t *data, int w, int h, int stride)
         }
     }
 
-    s_pipe.st.dn_blocks = nblk;                   /* 调参用：混合块数 / 全帧平均 SAD */
-    s_pipe.st.dn_sad = ntot ? (nsad / ntot) : 0;
+    s_pipe.st.dn_blocks = nblk;                   /* 实际混合块数 */
+    s_pipe.st.dn_sad = ntot ? (nsum_sad / ntot) : 0;      /* 差均值口径（旧，对比历史用）*/
+    s_pipe.st.dn_mmax = ntot ? (nsum_max / ntot) : 0;     /* 最大差口径（当前判据）*/
+    s_pipe.st.dn_motion = ntot ? (nmv * 100 / ntot) : 0;  /* 运动块占比 %（UI 显示）*/
+}
+
+/* ---------------- 运动估计（自动帧率用，与降噪解耦） ----------------
+ *
+ * 与降噪的区别：
+ *   - 降噪是 IIR：混合结果写回 prev，要靠多帧历史才能降噪，且高帧率会被守卫整体跳过
+ *   - 运动估计只比"相邻两帧"：每帧**无条件**把当前帧刷进参考缓冲，因此不依赖降噪开关，
+ *     在 50fps（降噪被跳过）时照样能工作
+ *
+ * 输出两个指标（写进 s_pipe.st，供自动帧率状态机判定）：
+ *   mv_peak  = 全帧"块内最大差"的**最大值**（0..63）——
+ *              用峰值而不是平均值：少数运动块的大差值不会被几千个静止块稀释，
+ *              这正是之前 mv 判据"运动时也恒为 0"的灵敏度根源
+ *   mv_ratio = 块内最大差 >= mv_thr 的块占比（%）
+ *
+ * 成本：4800 块 x 16 采样 + 每帧 600KB 分块拷贝，实测约 2~5ms；仅自动模式启用时才跑。
+ */
+static void pipe_motion_estimate(uint8_t *data, int w, int h, int stride)
+{
+    size_t need = (size_t)stride * h;
+    if (!s_pipe.mv_prev || s_pipe.mv_prev_cap < need ||
+        s_pipe.mv_prev_stride != stride || s_pipe.mv_prev_h != h) {
+        if (s_pipe.mv_prev) {
+            heap_caps_free(s_pipe.mv_prev);
+            s_pipe.mv_prev = NULL;
+            s_pipe.mv_prev_cap = 0;
+        }
+        uint8_t *p = (uint8_t *)heap_caps_malloc(need, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!p) {
+            ESP_LOGE(TAG, "motion prev buf %u B alloc failed", (unsigned)need);
+            s_pipe.mv_on = false;                 /* 直接关掉，不反复报错刷屏 */
+            s_pipe.st.mv_peak = 0;
+            s_pipe.st.mv_ratio = 0;
+            s_pipe.st.mv_ready = 0;
+            return;
+        }
+        s_pipe.mv_prev = p;
+        s_pipe.mv_prev_cap = need;
+        s_pipe.mv_prev_stride = stride;
+        s_pipe.mv_prev_h = h;
+        s_pipe.mv_has_prev = false;
+    }
+    if (!s_pipe.mv_has_prev) {
+        memcpy(s_pipe.mv_prev, data, need);
+        s_pipe.mv_has_prev = true;
+        s_pipe.st.mv_peak = 0;
+        s_pipe.st.mv_ratio = 0;
+        /* ⚠️ 基准帧的 mv 恒为 0，不是"画面静止"的结论。判定方必须靠 mv_ready
+           区分"真实比较结果"与"刚重建基准"，否则每次重开运动估计都会立刻读到
+           一个全 0 样本、把 50fps 误判成静止（振荡的最后一环，2026-10-02） */
+        s_pipe.st.mv_ready = 0;
+        return;                                   /* 首帧：只建立参考帧 */
+    }
+
+    const int thr = s_pipe.mv_thr;
+    uint32_t peak = 0, nmv = 0, ntot = 0;
+
+    for (int y0 = 0; y0 < h; y0 += DN_BLOCK) {
+        int bh = (h - y0 < DN_BLOCK) ? (h - y0) : DN_BLOCK;
+        for (int x0 = 0; x0 < w; x0 += DN_BLOCK) {
+            int bw = (w - x0 < DN_BLOCK) ? (w - x0) : DN_BLOCK;
+
+            int bmax = 0;
+            for (int by = 0; by < bh; by += DN_SAD_STEP) {
+                const uint16_t *pc = (const uint16_t *)(data + (size_t)(y0 + by) * stride) + x0;
+                const uint16_t *pp = (const uint16_t *)(s_pipe.mv_prev + (size_t)(y0 + by) * stride) + x0;
+                for (int bx = 0; bx < bw; bx += DN_SAD_STEP) {
+                    int d = (int)((pc[bx] >> 5) & 0x3F) - (int)((pp[bx] >> 5) & 0x3F);
+                    if (d < 0) d = -d;
+                    if (d > bmax) bmax = d;
+                }
+            }
+            ntot++;
+            if ((uint32_t)bmax > peak) peak = (uint32_t)bmax;
+            if (bmax >= thr) nmv++;
+
+            /* 每帧无条件刷新参考帧（只比相邻帧，不需要多帧历史）*/
+            for (int y = 0; y < bh; y++) {
+                uint16_t *pc = (uint16_t *)(data + (size_t)(y0 + y) * stride) + x0;
+                uint16_t *pp = (uint16_t *)(s_pipe.mv_prev + (size_t)(y0 + y) * stride) + x0;
+                memcpy(pp, pc, (size_t)bw * 2);
+            }
+        }
+    }
+
+    s_pipe.st.mv_peak = peak;
+    s_pipe.st.mv_ratio = ntot ? (nmv * 100 / ntot) : 0;
+    s_pipe.st.mv_ready = 1;      /* 本样本来自真实的相邻帧比较，可以据此下结论 */
+}
+
+/* ---------------- AE/AWB 统计采样（app_camauto 用） ----------------
+ *
+ * 在 WB/镜像/降噪之前对原始帧做稀疏采样（每 8 像素 x 每 8 行，640x480 -> 4800 点），
+ * 量出"传感器直出"的亮度与 R/G/B 均值：AWB 需要校正前的通道比例，
+ * AE 需要不受 WB 增益影响的真实亮度。采样走位段拆取，无乘除，成本可忽略。
+ */
+static void pipe_ae_stats(const uint8_t *data, int w, int h, int stride, img_fmt_t fmt)
+{
+    uint32_t rs = 0, gs = 0, bs = 0, n = 0;
+    if (fmt == IMG_FMT_RGB565) {
+        for (int y = 0; y < h; y += 8) {
+            const uint16_t *row = (const uint16_t *)(data + (size_t)y * stride);
+            for (int x = 0; x < w; x += 8) {
+                uint16_t v = row[x];
+                rs += (v >> 11) & 0x1F;
+                gs += (v >> 5) & 0x3F;
+                bs += v & 0x1F;
+                n++;
+            }
+        }
+        if (n == 0) {
+            return;
+        }
+        uint32_t r5 = rs / n, g6 = gs / n, b5 = bs / n;
+        rs = (r5 << 3) | (r5 >> 2);         /* 5/6/5bit -> 8bit */
+        gs = (g6 << 2) | (g6 >> 4);
+        bs = (b5 << 3) | (b5 >> 2);
+    } else if (fmt == IMG_FMT_RGB888) {
+        for (int y = 0; y < h; y += 8) {
+            const uint8_t *row = data + (size_t)y * stride;
+            for (int x = 0; x < w; x += 8) {
+                rs += row[x * 3];
+                gs += row[x * 3 + 1];
+                bs += row[x * 3 + 2];
+                n++;
+            }
+        }
+        if (n == 0) {
+            return;
+        }
+        rs /= n; gs /= n; bs /= n;
+    } else {
+        return;                              /* JPEG 压缩帧没有像素可采 */
+    }
+    s_pipe.st.ae_r = rs;
+    s_pipe.st.ae_g = gs;
+    s_pipe.st.ae_b = bs;
+    s_pipe.st.ae_luma = (77u * rs + 151u * gs + 28u * bs) >> 8;   /* Rec.601 */
+    s_pipe.st.ae_stats_us = esp_timer_get_time();
 }
 
 /*
@@ -448,6 +664,9 @@ static esp_err_t pipe_copy_into(int idx, const uint8_t *data, int w, int h, int 
     sl->frame.fmt = fmt;
     sl->frame.dec_ms = (uint32_t)((esp_timer_get_time() - t0) / 1000);   /* raw 帧=拷贝耗时 */
     sl->frame.seq = s_pipe.st.rx_frames + 1;
+    /* ⚠️ 这里不做 C2M 回写：publish_raw 在拷贝之后还会在槽内就地写入
+     * （DN、白平衡+镜像），回写必须等所有 CPU 写入完成后统一做——
+     * 见 publish_raw 末尾与 HANDOVER 廿一节的顺序坑 */
     return ESP_OK;
 }
 
@@ -461,6 +680,7 @@ static void pipe_publish(int slot)
     s_pipe.st.height = fr.height;
 
     s_pipe.slot[slot].frame.ts_us = esp_timer_get_time();
+    s_pipe.last_pub_us = s_pipe.slot[slot].frame.ts_us;   /* 按需发布的强制下限计时 */
     xSemaphoreTake(s_pipe.lock, portMAX_DELAY);
     s_pipe.latest = slot;
     s_pipe.slot[slot].consumed = false;
@@ -501,16 +721,33 @@ static void pipe_report(void)
     if (win < 1000000) {
         return;
     }
-    s_pipe.st.fps = (float)s_pipe.fps_cnt * 1000000.0f / (float)win;
+    uint32_t n = s_pipe.fps_cnt;
+    s_pipe.st.fps = (float)n * 1000000.0f / (float)win;
     s_pipe.fps_win = now;
     s_pipe.fps_cnt = 0;
     app_status_set(APP_MOD_PIPE, true, "%dx%d %.1ffps %ums",
                    s_pipe.st.width, s_pipe.st.height, (double)s_pipe.st.fps, (unsigned)s_pipe.st.dec_ms);
-    if (s_pipe.st.dec_frames) {
+    if (s_pipe.st.dec_frames && n) {
         app_usb_link_log("imgpipe: %dx%d %.1ffps dec=%ums jpeg=%"PRIu32"B rx=%"PRIu32" drop=%"PRIu32,
                          s_pipe.st.width, s_pipe.st.height, (double)s_pipe.st.fps,
                          (unsigned)s_pipe.st.dec_ms, s_pipe.st.jpeg_bytes,
                          s_pipe.st.rx_frames, s_pipe.st.dropped);
+        /* 分段耗时（每帧均值 us）：发布侧 copy/ae/dn/post/crc/msync + 消费侧失效；
+         * skip = 按需发布在源头跳过的帧数（这些帧没进 copy/post，n 是实际发布数）*/
+        uint32_t inv_n = s_prof.inv_n ? s_prof.inv_n : 1;
+        uint32_t lat_n = s_prof.lat_n ? s_prof.lat_n : 1;
+        app_usb_link_log("imgpipe/prof n=%u pub[copy %u ae %u dn %u post %u crc %u msync %u skip %u] "
+                         "get[inv %uus max %u n=%u %.0fMB/s lat %ums max %u]",
+                         (unsigned)n,
+                         (unsigned)(s_prof.copy_us / n), (unsigned)(s_prof.ae_us / n),
+                         (unsigned)(s_prof.dn_us / n), (unsigned)(s_prof.post_us / n),
+                         (unsigned)(s_prof.crc_us / n), (unsigned)(s_prof.msync_us / n),
+                         (unsigned)s_prof.skip_n,
+                         (unsigned)(s_prof.inv_us / inv_n), (unsigned)s_prof.inv_max,
+                         (unsigned)s_prof.inv_n,
+                         (double)s_prof.inv_bytes / 1048576.0,
+                         (unsigned)(s_prof.lat_us / lat_n / 1000), (unsigned)s_prof.lat_max_ms);
+        memset(&s_prof, 0, sizeof(s_prof));
     }
 }
 
@@ -599,7 +836,7 @@ bool app_imgpipe_get_hflip(void)
     return s_pipe.hflip;
 }
 
-void app_imgpipe_set_wb_gain(int kr, int kb)
+static void wb_gain_set(int kr, int kb, bool log)
 {
     if (kr < 100) kr = 100;
     if (kr > 4000) kr = 4000;
@@ -607,8 +844,20 @@ void app_imgpipe_set_wb_gain(int kr, int kb)
     if (kb > 4000) kb = 4000;
     s_pipe.kr = kr;
     s_pipe.kb = kb;
-    ESP_LOGW(TAG, "software WB: R*%.3f B*%.3f", kr / 1000.0, kb / 1000.0);
-    app_usb_link_log("imgpipe: wb kr=%d kb=%d", kr, kb);
+    if (log) {
+        ESP_LOGW(TAG, "software WB: R*%.3f B*%.3f", kr / 1000.0, kb / 1000.0);
+        app_usb_link_log("imgpipe: wb kr=%d kb=%d", kr, kb);
+    }
+}
+
+void app_imgpipe_set_wb_gain(int kr, int kb)
+{
+    wb_gain_set(kr, kb, true);
+}
+
+void app_imgpipe_set_wb_gain_quiet(int kr, int kb)
+{
+    wb_gain_set(kr, kb, false);
 }
 
 void app_imgpipe_get_wb_gain(int *kr, int *kb)
@@ -636,9 +885,61 @@ int app_imgpipe_get_dn(void)
     return s_pipe.dn;
 }
 
+void app_imgpipe_set_ae_stats(bool on)
+{
+    if (s_pipe.ae_stats_on == on) {
+        return;
+    }
+    s_pipe.ae_stats_on = on;
+    if (!on) {
+        s_pipe.st.ae_stats_us = 0;       /* 让 AE 立刻看到"没有新鲜数据" */
+    }
+    ESP_LOGI(TAG, "ae stats sampling %s", on ? "on" : "off");
+}
+
 void app_imgpipe_reset_prev(void)
 {
     s_pipe.has_prev = false;
+    s_pipe.mv_has_prev = false;    /* 运动估计的参考帧也一起丢弃 */
+    s_pipe.st.mv_ready = 0;
+}
+
+void app_imgpipe_set_motion_detect(bool on)
+{
+    if (s_pipe.mv_on == on) {
+        return;
+    }
+    s_pipe.mv_on = on;
+    s_pipe.mv_has_prev = false;
+    s_pipe.st.mv_ready = 0;
+    ESP_LOGW(TAG, "motion detect -> %s (thr=%d)", on ? "ON" : "OFF", s_pipe.mv_thr);
+    app_usb_link_log("imgpipe: motion detect %s", on ? "on" : "off");
+}
+
+void app_imgpipe_set_motion_thr(int thr)
+{
+    if (thr < 1) thr = 1;
+    if (thr > 63) thr = 63;
+    s_pipe.mv_thr = thr;
+    s_pipe.mv_has_prev = false;
+    s_pipe.st.mv_ready = 0;
+    ESP_LOGW(TAG, "motion thr -> %d", thr);
+}
+
+void app_imgpipe_set_pub_demand(bool on)
+{
+    if (s_pipe.pub_demand == on) {
+        return;
+    }
+    s_pipe.pub_demand = on;
+    ESP_LOGW(TAG, "publish-on-demand -> %s (min %d ms)", on ? "ON" : "OFF",
+             CONFIG_APP_CAM_PUB_MIN_MS);
+    app_usb_link_log("imgpipe: pub_demand %s", on ? "on" : "off");
+}
+
+bool app_imgpipe_get_pub_demand(void)
+{
+    return s_pipe.pub_demand;
 }
 
 void app_imgpipe_select_src(app_img_src_t src)
@@ -658,17 +959,54 @@ esp_err_t app_imgpipe_publish_raw(const uint8_t *data, int w, int h, int stride,
         return ESP_ERR_INVALID_STATE;        /* PC 模式：摄像头帧丢弃，不做拷贝 */
     }
 
+    /* ---- 发布端按需发布（2026-10-06 待办 5）----
+     * 相机 50fps 每帧 ~17ms 的 copy+post（614KB 拷贝 8.6ms + 白平衡/镜像 8.3ms），
+     * 而消费者实际只取 ~7(AI)+10(预览) 帧/s —— 没人要的帧整条链路白跑，
+     * CPU1 约 87% 的占空比花在无效帧上（日光分段计时，HANDOVER 第廿一节）。
+     * 跳过条件：没有消费者正在 get_frame 里等帧 && 距上次真实发布 < 强制间隔。
+     * ⚠️ 强制下限必须有：AE 亮度采样 / 运动估计 / 时域降噪全挂在发布路径上，
+     * 全跳过会让夜视阶梯与 AE 失去输入（luma 冻结 = 判定状态机瞎掉）。
+     * 10 帧/s 足够喂饱全部判定节流（AE 250ms / AUTO 探测窗 300ms）。 */
+    if (s_pipe.pub_demand) {
+        bool waiter = s_pipe.waiters > 0;
+        bool forced = (esp_timer_get_time() - s_pipe.last_pub_us) >=
+                      (int64_t)CONFIG_APP_CAM_PUB_MIN_MS * 1000;
+        if (!waiter && !forced) {
+            s_pipe.st.pub_skip++;
+            s_prof.skip_n++;
+            return ESP_OK;
+        }
+    }
+
     int slot = pipe_take_slot();
     if (slot < 0) {
         s_pipe.st.dropped++;
         return ESP_ERR_NO_MEM;               /* 消费者还没放槽，丢帧 */
     }
+    int64_t t_sect = esp_timer_get_time();
     esp_err_t err = pipe_copy_into(slot, data, w, h, stride, fmt);
     if (err != ESP_OK) {
         s_pipe.st.dropped++;
         return err;
     }
+    s_prof.copy_us += (uint32_t)(esp_timer_get_time() - t_sect);
     uint8_t *slot_data = s_pipe.slot[slot].frame.data;
+
+    /* AE/AWB 统计：必须在降噪/镜像/白平衡之前采（要的是传感器直出画像）*/
+    if (s_pipe.ae_stats_on) {
+        t_sect = esp_timer_get_time();
+        pipe_ae_stats(slot_data, w, h, stride, fmt);
+        s_prof.ae_us += (uint32_t)(esp_timer_get_time() - t_sect);
+    }
+
+    /* 运动估计（自动帧率用）：跑在降噪之前、用原始帧；与降噪解耦，高帧率下也照跑 */
+    if (s_pipe.mv_on) {
+        int64_t t_mv = esp_timer_get_time();
+        pipe_motion_estimate(slot_data, w, h, stride);
+        s_pipe.st.mv_ms = (uint32_t)((esp_timer_get_time() - t_mv) / 1000);
+        /* 新鲜度时戳：判定方靠"这一帧有没有新样本"来决定能不能下结论 */
+        s_pipe.st.mv_stats_us = esp_timer_get_time();
+    }
 
     /* 时域降噪（必须在镜像之前，见 pipe_dn_apply 注释）；高帧率下跳过以保证链路稳定 */
     if (s_pipe.dn > 0 && fmt == IMG_FMT_RGB565) {
@@ -679,16 +1017,42 @@ esp_err_t app_imgpipe_publish_raw(const uint8_t *data, int w, int h, int stride,
         } else {
             int64_t t_dn = esp_timer_get_time();
             pipe_dn_apply(slot_data, w, h, stride);
-            s_pipe.st.dn_ms = (uint32_t)((esp_timer_get_time() - t_dn) / 1000);
+            uint32_t d = (uint32_t)((esp_timer_get_time() - t_dn) / 1000);
+            s_pipe.st.dn_ms = d;
+            s_prof.dn_us += d * 1000;
         }
     }
 
     /* 只处理槽里的副本（白平衡 + 镜像一次遍历），不动摄像头 mmap 缓冲 */
+    t_sect = esp_timer_get_time();
     pipe_postprocess(slot_data, w, h, stride, fmt,
                      s_pipe.kr, s_pipe.kb, s_pipe.hflip);
+    s_prof.post_us += (uint32_t)(esp_timer_get_time() - t_sect);
     int bpp = (fmt == IMG_FMT_RGB565) ? 2 : 3;
     s_pipe.st.rx_frames++;
     s_pipe.st.jpeg_bytes = (uint32_t)(stride > 0 ? stride : w * bpp) * (uint32_t)h;
+    /* ⚠️ 缓存一致性回写（2026-10-04，HANDOVER 廿一节）：本函数跑在 camera 任务
+     * （钉 CPU1），拷贝/DN/镜像的 CPU 写脏行留在 CPU1 的 L1；faceai（CPU0）与
+     * 0x05 stream 编码 DMA 读的都是 L2/RAM——P4 双核 L1 互不一致且无跨核 IPI，
+     * 必须在发布前统一回写。⚠️ 位置铁律：必须在该帧所有 CPU 写入（含 postprocess
+     * 的镜像）之后——回写放在拷贝阶段会让镜像内容滞留本核 L1，消费者读到
+     * "部分行镜像、部分行未镜像"的撕裂画面（实测：上下区域左右排序相反） */
+    {
+        size_t need = (size_t)stride * h;
+        /* ⚠️ 全帧 CRC32 实测 **18.5ms/帧**（614KB）——纯诊断（结果帧 frm_crc/ai_crc
+         * 对照，见 HANDOVER 廿一节），默认关（APP_CAM_FRAME_CRC）。常驻它是单核
+         * ~30% 的 CPU 白烧，直接压低整条管线帧率（2026-10-06 分段计时查出来的）。*/
+#if CONFIG_APP_CAM_FRAME_CRC
+        int64_t tc = esp_timer_get_time();
+        s_pipe.slot[slot].frame.crc32 = esp_rom_crc32_le(0, slot_data, need);
+        s_prof.crc_us += (uint32_t)(esp_timer_get_time() - tc);
+#endif
+        s_pipe.slot[slot].frame.dec_core = (int)xPortGetCoreID();
+        int64_t tm = esp_timer_get_time();
+        esp_cache_msync(slot_data, need,
+                        ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+        s_prof.msync_us += (uint32_t)(esp_timer_get_time() - tm);
+    }
     pipe_publish(slot);
     return ESP_OK;
 }
@@ -708,13 +1072,36 @@ esp_err_t app_imgpipe_get_frame(img_frame_t *out, uint32_t timeout_ms)
             s_pipe.slot[idx].consumed = true;
             *out = s_pipe.slot[idx].frame;
             xSemaphoreGive(s_pipe.lock);
+            /* ⚠️ 跨核缓存一致性（2026-10-04，HANDOVER 廿一节）：生产者可能运行在
+             * 另一个核（CAM 路径 memcpy 在 CPU1 / JPEG 解码 invalidate 在解码核），
+             * P4 双核 L1 互不一致、无跨核 IPI——消费者核的 L1 可能残留本缓冲
+             * 上一次内容的 cache 行。在读者核上做 M2C 失效（缓冲无脏行，安全；
+             * cap 由 jpeg_alloc_decoder_mem 64B 对齐，满足 M2C 对齐要求）。 */
+            int64_t t_inv = esp_timer_get_time();
+            esp_cache_msync(out->data, s_pipe.slot[idx].cap,
+                            ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+            uint32_t inv = (uint32_t)(esp_timer_get_time() - t_inv);
+            s_prof.inv_us += inv;
+            s_prof.inv_n++;
+            s_prof.inv_bytes += s_pipe.slot[idx].cap;
+            if (inv > s_prof.inv_max) s_prof.inv_max = inv;
+            /* 发布 → 被取走 的排队延迟：帧池拥塞/消费者跟不上的直接指标 */
+            uint32_t lat_ms = (uint32_t)((esp_timer_get_time() - out->ts_us) / 1000);
+            s_prof.lat_us += (uint64_t)lat_ms * 1000;
+            s_prof.lat_n++;
+            if (lat_ms > s_prof.lat_max_ms) s_prof.lat_max_ms = lat_ms;
             return ESP_OK;
         }
         xSemaphoreGive(s_pipe.lock);
         if (esp_timer_get_time() >= deadline) {
             return ESP_ERR_NOT_FOUND;
         }
+        /* 告诉发布端"有消费者在等帧"：按需发布据此决定要不要为这一帧跑
+         * copy/post 链。等帧是 1 tick 一轮的短窗口，进出都计数（启发式即可，
+         * 偶发的错过/多算只影响一帧，下一轮相机帧就纠正）。 */
+        s_pipe.waiters++;
         xSemaphoreTake(s_pipe.evt, 1);   /* 仅作唤醒(1 tick)，超时后重查；0 tick 会空转 */
+        s_pipe.waiters--;
     }
 }
 
@@ -837,10 +1224,19 @@ esp_err_t app_imgpipe_init(void)
 
     s_pipe.latest = -1;
     s_pipe.auto_ack = true;
-    s_pipe.hflip = CONFIG_APP_CAM_HFLIP;   /* 摄像头模组安装方向导致的镜像，默认翻回来 */
+    s_pipe.pub_demand = CONFIG_APP_CAM_PUB_ON_DEMAND;
+    s_pipe.last_pub_us = esp_timer_get_time();
+    s_pipe.waiters = 0;
+    /* 镜像：传感器 HMIRROR 已生效时软件镜像关闭（两处都开=翻回去）；传感器不支持
+       （set/get 失败）则退回软件行内镜像 */
+    s_pipe.hflip = CONFIG_APP_CAM_HFLIP && !app_camera_sensor_hflip();
+    if (s_pipe.hflip) {
+        ESP_LOGW(TAG, "sensor hflip unavailable, software hflip ON");
+    }
     s_pipe.kr = CONFIG_APP_CAM_WB_KR;      /* 软件白平衡（默认按本机模组实测偏绿量校正） */
     s_pipe.kb = CONFIG_APP_CAM_WB_KB;
     s_pipe.dn = CONFIG_APP_CAM_DN;         /* 时域降噪档（0=关，运行时可用 cam 命令改） */
+    s_pipe.mv_thr = CONFIG_APP_CAM_MOTION_THR;   /* 运动估计阈值（自动帧率模式下用） */
     s_pipe.fps_win = esp_timer_get_time();
     s_pipe.rx_buf = heap_caps_malloc(PIPE_RX_BUF, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     ESP_RETURN_ON_FALSE(s_pipe.rx_buf, ESP_ERR_NO_MEM, TAG, "rx buf %d B", PIPE_RX_BUF);
@@ -859,7 +1255,10 @@ esp_err_t app_imgpipe_init(void)
     /* 摄像头已经出图就默认用它（板载源优先），否则等 PC 送帧 */
     s_pipe.src_mode = app_camera_ready() ? APP_IMG_SRC_CAM : APP_IMG_SRC_PC;
 
-    BaseType_t ok = xTaskCreate(imgpipe_task, "imgpipe", PIPE_TASK_STACK, NULL, PIPE_TASK_PRIO, NULL);
+    /* 钉 CPU0（与 faceai 同核）：解码后驱动 invalidate 生效于本核，消费者同核
+     * 读取天然一致；跨核场景由 get_frame 的读者侧 M2C 失效兜底（2026-10-04） */
+    BaseType_t ok = xTaskCreatePinnedToCore(imgpipe_task, "imgpipe", PIPE_TASK_STACK,
+                                            NULL, PIPE_TASK_PRIO, NULL, 0);
     ESP_RETURN_ON_FALSE(ok == pdPASS, ESP_FAIL, TAG, "task create");
 
     s_pipe.ready = true;

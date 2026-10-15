@@ -25,6 +25,10 @@ CONFIG_ESP_HOSTED_IDF_SLAVE_TARGET="esp32c6"
 CONFIG_ESP_HOSTED_SDIO_SLOT_1=y
 CONFIG_ESP_HOSTED_SDIO_BUS_WIDTH=4
 CONFIG_ESP_HOSTED_SDIO_CLOCK_FREQ_KHZ=40000
+# 复位脚 GPIO54 高有效（缺省值不对则 C6 复位失控、初始化必失败——厂商 demo 同款）
+CONFIG_ESP_HOSTED_SDIO_RESET_ACTIVE_HIGH=y
+CONFIG_ESP_HOSTED_SDIO_RESET_SLAVE_GPIO_MIN=54
+CONFIG_ESP_HOSTED_SDIO_RESET_SLAVE_GPIO_MAX=54
 CONFIG_IDF_EXPERIMENTAL_FEATURES=y
 
 # LVGL fonts / color depth
@@ -61,8 +65,68 @@ CONFIG_APP_ETH_STATIC_IP="192.168.33.2"
 CONFIG_APP_ETH_STATIC_NETMASK="255.255.254.0"
 
 CONFIG_APP_FACEAI_DETECT_THR=50
-CONFIG_APP_FACEAI_MATCH_THR=70
+# F11 检测模型：两个模型都打包进 flash（同一 rodata blob，MSRMNP 187KB + ESPDet 544KB），
+# 用 APP_FACEAI_DETECT_MODEL 切换，无需改 flash 配置即可回退。
+CONFIG_FLASH_HUMAN_FACE_DETECT_MSRMNP_S8_V1=y
+CONFIG_FLASH_ESPDET_PICO_224_224_FACE=y
+CONFIG_ESPDET_PICO_224_224_FACE=y
+# 当前选用 MSRMNP（2026-10-06 收口）：白天检出 ~30%（20s 约 30 个样本，够 A/B 采样），
+# 特征干净（自匹配 0.995）；ESPDet 检出 100% 但特征自匹配崩到 0.34~0.79（大模型执行
+# 序列污染特征，esp-dl 无独立 arena，见 HANDOVER 廿一节）。标定的看家本领是分离度，
+# 故优先 MSRMNP；若现场检出确实不够用再切 ESPDet（接受特征压缩），运行时
+# {"cmd":"mode","det_thr":0.2~0.3} 可现场扫（但注意：夜间长曝光 + 闭眼/失焦类
+# "结构性失败"降阈值救不了）。
+CONFIG_APP_FACEAI_DETECT_MSRMNP=y
+# F3 双阈值（2026-10-06 A 侧补测后定值）：lo=hi=0.61（灰区收口）。依据：标定 A 相位
+# win-max median 0.641 / max 0.876，B（陌生人）上沿 0.565（真机验证零误报，余量
+# +0.045）；0.70 时本人命中帧占比只有 0.61 的一半。⚠️ 复算确认真正的限速器是 F2
+# 窗口票数规则（检出间歇时窗口凑不满 M/M+1 票，票数规则吃掉 8/10 个过线帧）——
+# 提识别率要靠检出连续性（迎光/眼平/看镜头），单降阈值收益有限。
+CONFIG_APP_FACEAI_MATCH_THR_HI=61
+CONFIG_APP_FACEAI_MATCH_THR_LO=61
+# F2 快速通道（2026-10-06 晚）：本帧 raw_sim >= 0.80 时不等窗口票数直接确认 match。
+# 依据：A 相位 53% 判定帧过 0.61 分数线但票数规则吃掉 8/10（命中率真瓶颈是检出
+# 间歇）；离线复算 0.80 快速通道命中 2/19 -> 8/19、B 误报 0/58；真人陌生人上沿
+# 0.587 → 余量 +0.21。运行时 {"cmd":"mode","fast_thr":0.80}，0=关。
+CONFIG_APP_FACEAI_FAST_THR=80
 CONFIG_APP_FACEAI_MAX_BOXES=5
+# F6 事件去重（2026-10-06 第 2 轮）：同一人的 match / 稳定 reject 在 T ms 内只报一次
+# 事件，窗口期内 event 回落 none（match/sim/stable 字段照常）。运行时
+# {"cmd":"mode","dedup_ms":N} 可调，0=关。
+CONFIG_APP_FACEAI_EVENT_DEDUP_MS=5000
+# F7 多人脸（2026-10-06 第 2 轮）：按面积前 N 张脸分别提特征比对（主脸走完整
+# F2/F4/F6，副脸裸比对）；boxes[i] 第 5/6 位追加 name/sim（向后兼容）。运行时
+# {"cmd":"mode","multi":N}，N=1 即旧行为。每多一张脸每帧 +93ms 提特征。
+CONFIG_APP_FACEAI_MULTI_MAX=2
+# F9 容量提升（2026-10-11）：名表从 NVS 2048B 字符串迁移到 /storage/names.json
+# （NVS 仅只读兜底 + 首次开机自动迁移）；人数上限 10 -> 64、特征条数上限 32 -> 320。
+# 达到人数上限后 register 回 "lib full"。改本项后必须 idf.py reconfigure。
+CONFIG_APP_FACEAI_MAX_PERSONS=64
+CONFIG_APP_FACEAI_MAX_FEATS=320
+# F9 必需：/storage 的 FATFS 默认不支持长文件名（CONFIG_FATFS_LFN_NONE=y），而
+# "names.json" 扩展名 4 字符（非 8.3）→ fopen/rename 全部失败（实测启动报
+# "names.json write failed"，名表只能靠 NVS 兜底）。开启堆版 LFN 后 names.json 可读写。
+CONFIG_FATFS_LFN_HEAP=y
+# 发布端按需发布（2026-10-06 待办 5）：相机帧在没有消费者等帧且未到强制间隔时
+# 整条 copy/AE/DN/post 链跳过（50fps 下省 CPU1 大头）。强制下限 100ms 保证
+# AE/运动估计/降噪输入不冻结。运行时 {"cmd":"cam","pub_demand":false} 可关。
+CONFIG_APP_CAM_PUB_ON_DEMAND=y
+CONFIG_APP_CAM_PUB_MIN_MS=100
+# AE 曝光上限（2026-10-06 晚统一 A 相实测立项）：暗光下积分超过 40ms 转提增益保锐度——
+# 100ms 长积分模糊帧 win-max median 只有 0.638，20ms 锐利帧 0.753；锐利的噪声图优于
+# 模糊的干净图，快速通道随特征质量生效（命中 20%->36%）。夜视档（tier>=1）自动解除
+# （夜视要亮度且人脸已门控）。运行时 {"cmd":"cam","ae_exp_max_ms":N}，0=解除。
+CONFIG_APP_CAM_AE_EXP_MAX_MS=40
+# 深探常关：每帧多跑 1~2 次 s_feat->run() 会污染 esp-dl 模型状态（同一人 sim_raw
+# 0.26~0.84 乱跳，见 HANDOVER 廿一节）——阈值标定/质量评估必须保持关闭。
+CONFIG_APP_FACEAI_DIAG_DEEP=n
+# F4 轻跟踪节流（2026-10-06 实测定值）：同一张脸、位移小于 250ms 内跳过 93ms 提特征。
+# ⚠️ 原写 150ms 是**死值**：AI 处理一帧要 ~175~244ms（相机+预览流时 175ms、PC 送图 244ms），
+# 比 150ms 还长 → 保持窗永远触发不了（只有跳过提特征才能变快，而跑不进 150ms 就永远不跳）。
+# 250ms 实测：PC 路径 reuse 37%、结果帧率 +36%；相机路径提特征频率约 5.7→3.5 次/秒。
+# 代价：跳过帧不进 F2 平滑窗 → 确认延迟随 HOLD 线性变长（K=5 帧 × 250ms ≈ 1.2s）。
+# 运行时可调（不必重烧）：{"cmd":"mode","trk_hold_ms":400}，0 = 关闭 F4。
+CONFIG_APP_FACEAI_TRACK_HOLD_MS=250
 
 # 板子实测（2026-09-30）：
 #  - MIPI-DSI 屏读取挂死：esp_lcd panel_io_dbi_rx_param() 在
@@ -70,8 +134,9 @@ CONFIG_APP_FACEAI_MAX_BOXES=5
 #    TWDT。屏幕未接/未上电时必现。故无屏期先关显示（PC 当 HMI）。
 CONFIG_APP_ENABLE_DISPLAY=n
 #  - C6 协处理器 esp-hosted slave fw 2.3.2 vs 宿主驱动 3.0.7 主版本不匹配，
-#    wifi 初始化不返回；先关掉 wifi 保底（后续需刷匹配的 C6 固件或降级宿主驱动）。
-CONFIG_APP_ENABLE_WIFI=n
+#    wifi 初始化不返回；2026-10-02 已按厂商 wifi_scan 模板锁定版本对修复：
+#    esp_wifi_remote 0.14.2 + esp_hosted 2.0.13（见 main/idf_component.yml）。
+CONFIG_APP_ENABLE_WIFI=y
 
 # ---- edge AI performance preset (esp-dl P4 recommendation) ----
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
@@ -81,3 +146,23 @@ CONFIG_CACHE_L2_CACHE_LINE_128B=y
 # tinyusb CDC device class
 CONFIG_TINYUSB_CDC_ENABLED=y
 CONFIG_TINYUSB_CDC_RX_BUFSIZE=2048
+
+# WiFi/BLE restore (2026-10-02): esp_wifi_init + esp_hosted init chain overflows
+# the default 3584B main-task stack (Stack protection fault); esp-hosted recommends
+# FreeRTOS tick 1000Hz (100 causes bus-level jitter warnings)
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+CONFIG_FREERTOS_HZ=1000
+
+# ---- BLE (2026-10-04, HANDOVER 任务17): NimBLE host 跑在 P4，BT controller
+# 在 C6 从机上，HCI 走 SDIO (esp-hosted VHCI)。照 esp_hosted 2.12.13 例程
+# host_nimble_bleprph_host_only_vhci 的 sdkconfig.defaults：
+#   controller 必须禁用（用从机的）、NimBLE host、UART transport 关、
+#   esp-hosted BT/NimBLE-VHCI 开。
+CONFIG_BT_ENABLED=y
+CONFIG_BT_CONTROLLER_DISABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_TRANSPORT_UART=n
+CONFIG_ESP_HOSTED_ENABLE_BT_NIMBLE=y
+CONFIG_ESP_HOSTED_NIMBLE_HCI_VHCI=y
+CONFIG_ESP_HOSTED_SDIO_RX_Q_SIZE=12
+CONFIG_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y
