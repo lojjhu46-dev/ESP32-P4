@@ -8,6 +8,10 @@ PC 端 LVGL SDL 模拟器与板端同源 UI 显示与操作。
 **新会话/新 agent 接手：先读 [`docs/HANDOVER.md`](docs/HANDOVER.md)**（全部踩坑与结论都在那里，
 本 README 只做导览）。
 
+> ⚠️ **本仓库不含第三方组件与厂商资料**（体积原因）：`esp-dl/`、`esp-adf-libs/`、`lvgl/`、
+> `managed_components/`、`C3982-JC-ESP32P4-M3-DEV/`、各级 `build/`。克隆后请按
+> **根 [`README.md`](../README.md) 的「未入库的依赖与文件」** 一节补齐，否则无法 configure。
+
 ## 当前能力（2026-10-07，全部真机验证）
 
 - **白天**：50fps 恒定 + AE/AWB/厂商标定 CCM；曝光余量阶梯（50→20→10fps）防偏暗；
@@ -51,10 +55,12 @@ pc_host/              PC 侧 Python 工具（仅标准库 + pyserial；py3.14 �
   _f7_test.py         F7 多人脸验收（双人拼图 PC 送图）
   night_accept_test.py / ae_accept_test.py   夜视阶梯 / AE 回归
   _cycle_probe.py     状态机调试探针（单连接、时间表发命令）
-../lvgl_project/lv_port_pc_vscode_official   LVGL SDL 模拟器（WSL 编译运行）
-../esp-dl ../esp_video ../esp_cam_sensor ../esp-adf-libs ../lvgl   本地检出的组件
-                      （删除/移动会导致 configure 失败；esp-dl/esp_video/esp_cam_sensor
-                       已打 patch，升级组件必须重打，见 HANDOVER 廿二节 15 节登记表）
+../lvgl_project/lv_port_pc_vscode_official   LVGL SDL 模拟器（WSL 编译运行；
+                      库内只保留自研 main/ 与配置，其 lvgl/build/bin 按根 README 自备）
+【已在库内】../esp_video ../esp_cam_sensor   本地化并打过 patch 的组件（configure 必需，不可移动）
+【需自备】  ../esp-dl ../esp-adf-libs ../lvgl  第三方组件（根 README「未入库的依赖」有获取命令；
+                      删除/移动会导致 configure 失败；esp-dl/esp_video/esp_cam_sensor 已打 patch，
+                      升级组件必须重打，见 HANDOVER 廿二节 15 节登记表）
 ```
 
 ## main/ 模块一览
@@ -149,7 +155,8 @@ python pc_host/thr_calib.py --tcp 192.168.33.2:3333                 # 阈值标�
 1. 镜头对准拍摄位 + 补光——检出连续性（21%）与成簇性是识别率唯一剩余瓶颈
 2. ⏳ 提交 esp-dl issue（英文草稿 `docs/esp-dl_issue_draft.md` + 补丁 + trace 已备；
    Espressif 修复前，绝对阈值跨开机不可用，每 boot 相对标定绕行）
-3. 第 3 轮：F9 名单容量提升 / F10 特征库备份导出导入（F8 UI 已完成 ✅，
-   **F8b 弹窗 4 个 UI 缺陷已修 + 合成点击逐项验证**，见 HANDOVER 廿二节 17 节）
-4. ae_accept_test.py 按 AE 曝光上限重校；白天自然光白参考重标（wb_kr/kb + ccm_mix）；
+3. ae_accept_test.py 按 AE 曝光上限重校；白天自然光白参考重标（wb_kr/kb + ccm_mix）；
    BLE 手机端 nRF Connect 交互验收
+4. P3 可选进阶：F11 换检测/特征模型、F12 活体防照片、F13 事件外发（见
+   `docs/face_recog_day_plan.md`）—— **第 3 轮 F8/F9/F10 已全部完成 ✅**
+   （F9 名表 64 人 `names.json`；F10 库备份/恢复 JCLINK 0x06 + `jc_test.py db_backup/db_restore`）

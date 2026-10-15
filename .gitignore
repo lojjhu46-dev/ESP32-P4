@@ -1,6 +1,28 @@
-# 根级忽略（2026-10-15）
-#
-# 1) `nul`：Windows 把 `> nul` 当文件名造出来的幽灵设备名文件。
-#    git 无法索引它（error: short read while indexing nul），且常规手段删不掉，
-#    会直接卡死 `git add .`。本地忽略即可，不影响任何流程。
+# ============================================================================
+# 根级忽略（2026-10-15 仓库瘦身）
+# 这些条目体积大或属第三方（含 2 个超 GitHub 100MB 硬限的文件），已从历史剔除，
+# 磁盘上仍保留。获取方式见根 README「未入库的依赖与文件」一节；
+# 目录约定见 jc_p4_app/docs/HANDOVER.md 第 6 节。
+# ============================================================================
+
+# --- 编译产物 / 可由命令再生成 ---
+jc_p4_app/build/
+jc_p4_app/managed_components/
+lvgl_project/*/build/
+lvgl_project/*/bin/
+
+# --- 第三方组件源码（本地 checkout，按 README 自行获取）---
+/lvgl/
+lvgl_project/*/lvgl/
+
+# --- 板卡厂商资料包（原理图/Demo，502MB，不在本仓库）---
+C3982-JC-ESP32P4-M3-DEV/
+
+# --- 开发期零散产物 ---
+_dev/
+jc_p4_app/_dev/
+_old_managed/
+
+# --- Windows 幽灵文件：`> nul` 被当文件名造出来的，git 无法索引
+#     （error: short read while indexing nul），会直接卡死 `git add .` ---
 /nul
