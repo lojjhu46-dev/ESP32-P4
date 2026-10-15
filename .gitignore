@@ -16,7 +16,10 @@ lvgl_project/*/bin/
 lvgl_project/*/lvgl/
 
 # --- 板卡厂商资料包（原理图/Demo，502MB，不在本仓库）---
+#     目录 + 根目录的原始 rar（144MB，**超 GitHub 100MB 硬限**，务必保持忽略，
+#     否则 `git add .` 会把它加回去、push 再次被 pre-receive hook 拒绝）
 C3982-JC-ESP32P4-M3-DEV/
+/C3982-JC-ESP32P4-M3-DEV.rar
 
 # --- 开发期零散产物 ---
 _dev/
