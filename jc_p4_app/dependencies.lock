@@ -316,7 +316,7 @@ dependencies:
     source:
       path: D:\esp32project\ESP32-P4\lvgl
       type: local
-    version: 9.6.0
+    version: '*'
 direct_dependencies:
 - espressif/dl_fft
 - espressif/esp-dl

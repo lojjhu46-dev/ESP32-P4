@@ -19,7 +19,7 @@ PC 端 LVGL SDL 模拟器 / 取景中枢显示与操作。
 |---|---|---|
 | `esp-dl/` | 第三方组件仓库，本地打过 patch（约 500MB） | `git clone --depth 1 -b v3.3.11 https://github.com/espressif/esp-dl.git`，再**按 `jc_p4_app/docs/HANDOVER.md` 第廿二节 15 节的 patch 登记表重打 4 个文件**（`zero_workspace/poison_workspace/run_trace/module_name` + Feat trace 透传） |
 | `esp-adf-libs/` | 第三方仓库，只需其中 `esp_new_jpeg` | `git clone --depth 1 --filter=blob:none --sparse https://github.com/espressif/esp-adf-libs.git` 然后 `git sparse-checkout set esp_new_jpeg` |
-| `lvgl/` | 第三方组件源码（约 200MB） | `git clone -b v9.3 https://github.com/lvgl/lvgl.git lvgl`（⚠️ 目录名必须叫 `lvgl`——`override_path` 要求目录名等于组件名） |
+| `lvgl/` | 第三方组件源码（约 200MB） | `git clone -b v9.6.0 --depth 1 https://github.com/lvgl/lvgl.git lvgl`（⚠️ 版本以 `jc_p4_app/dependencies.lock` 中的 `lvgl/lvgl: version` 为准 = **9.6.0**；⚠️ 目录名必须叫 `lvgl`——`override_path` 要求目录名等于组件名。本地**无 patch**，可放心重新克隆） |
 | `jc_p4_app/managed_components/` | 组件管理器官家目录，可再生成 | `idf.py reconfigure` 会按 `jc_p4_app/main/idf_component.yml` 自动拉取（registry 可达；离线方案见 HANDOVER 第三节） |
 | `C3982-JC-ESP32P4-M3-DEV/` | 板卡厂商资料包（规格书/原理图/Demo/烧录工具，502MB，含 144MB rar） | 向板卡厂商索取；**本仓库不含任何厂商资料**。硬件结论已整理进 [`docs/JC-ESP32P4-M3-DEV-开发要点.md`](docs/JC-ESP32P4-M3-DEV-开发要点.md) |
 | `lvgl_project/.../lvgl`、`build/`、`bin/` | 模拟器的第三方库与构建产物 | 该工程自带 `.gitmodules`：`git submodule update --init`；再 `cmake -B build -S . && cmake --build build -j8`（同源 UI 源码 `main/` **已在库内**） |
