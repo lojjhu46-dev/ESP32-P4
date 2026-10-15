@@ -60,8 +60,13 @@ static esp_err_t stream_encode(const img_frame_t *fr, uint8_t **out, uint32_t *o
     const uint8_t *in = fr->data;
     uint32_t in_size = (uint32_t)fr->stride * (uint32_t)fr->height;
 
-    /* 硬件编码器输入必须紧密排布（无 stride 参数） */
-    if (fr->stride != fr->width * bpp) {
+    /* 硬件 JPEG 编码器的 RGB 通道序与标准相反：编码出的 JPEG 红蓝对调
+     * （实测同一场景 raw 直出颜色正确、JPEG 错；PIL 与模拟器两个独立解码器
+     * 一致——故问题在编码器对输入的解读，且无配置项可改）。
+     * JPEG 是标准 JFIF，改解码端会留下非标准文件，所以在编码前把 R/B 换回：
+     * RGB565 位域交换 / RGB888 首尾字节交换，拷进私有缓冲（顺带完成 stride 重排）。
+     * 只影响 0x05 JPEG 链路：AI / raw / 相机路径都不经过这里。无条件走交换拷贝。 */
+    {
         size_t need = (size_t)fr->width * fr->height * bpp;
         if (s_st.in_cap < need) {
             if (s_st.in_buf) heap_caps_free(s_st.in_buf);
@@ -69,10 +74,25 @@ static esp_err_t stream_encode(const img_frame_t *fr, uint8_t **out, uint32_t *o
             s_st.in_cap = s_st.in_buf ? need : 0;
         }
         ESP_RETURN_ON_FALSE(s_st.in_buf, ESP_ERR_NO_MEM, TAG, "in buf %u B", (unsigned)need);
-        for (int y = 0; y < fr->height; y++) {
-            memcpy(s_st.in_buf + (size_t)y * fr->width * bpp,
-                   fr->data + (size_t)y * fr->stride,
-                   (size_t)fr->width * bpp);
+        if (bpp == 2) {
+            for (int y = 0; y < fr->height; y++) {
+                const uint16_t *src = (const uint16_t *)(fr->data + (size_t)y * fr->stride);
+                uint16_t *dst = (uint16_t *)(s_st.in_buf + (size_t)y * fr->width * 2);
+                for (int x = 0; x < fr->width; x++) {
+                    uint16_t v = src[x];
+                    dst[x] = (uint16_t)(((v & 0x001F) << 11) | (v & 0x07E0) | (v >> 11));
+                }
+            }
+        } else {
+            for (int y = 0; y < fr->height; y++) {
+                const uint8_t *src = fr->data + (size_t)y * fr->stride;
+                uint8_t *dst = s_st.in_buf + (size_t)y * fr->width * 3;
+                for (int x = 0; x < fr->width; x++) {
+                    dst[x * 3] = src[x * 3 + 2];
+                    dst[x * 3 + 1] = src[x * 3 + 1];
+                    dst[x * 3 + 2] = src[x * 3];
+                }
+            }
         }
         in = s_st.in_buf;
         in_size = (uint32_t)need;
@@ -154,6 +174,17 @@ static void stream_task(void *arg)
 
     while (1) {
         if (!s_st.enabled) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
+        /* ⚠️ 源模式守卫（2026-10-06 晚）：PC 送图模式下不取帧。0x05 回传对
+         * PC 源没有意义（发送方手里就有原图），而且 stream 与 AI 在帧池里
+         * 抢帧——每帧只交付一次，stream 抢到 = AI 无结果 = 该帧不回 0x02，
+         * PC 端读超时。上线后从没暴露：直连调试从不开 stream；取景中枢
+         * 上线后其保活把 stream 钉在开，才炸出这条竞态（经中枢跑回归实测：
+         * 帧结果随机丢失，注册/判定全乱）。 */
+        if (app_imgpipe_get_src() != APP_IMG_SRC_CAM) {
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
@@ -312,7 +343,11 @@ esp_err_t app_stream_init(void)
     if (s_st.win) return ESP_OK;
     s_st.win = esp_timer_get_time();
 
-    BaseType_t ok = xTaskCreate(stream_task, "stream", STREAM_TASK_STACK, NULL, STREAM_TASK_PRIO, NULL);
+    /* 钉 CPU0（与 imgpipe/faceai 同核）：get_frame 的 M2C 失效必须与随后的像素
+     * 读取同核才有效——未绑核任务在两核间迁移时，另一核 L1 的陈旧行会让 swap/
+     * 编码读到旧像素（实测开机窗口 JPEG 横带混拼，HANDOVER 廿一节） */
+    BaseType_t ok = xTaskCreatePinnedToCore(stream_task, "stream", STREAM_TASK_STACK,
+                                            NULL, STREAM_TASK_PRIO, NULL, 0);
     ESP_RETURN_ON_FALSE(ok == pdPASS, ESP_FAIL, TAG, "task create");
 
     app_status_set(APP_MOD_STREAM, true, "off");

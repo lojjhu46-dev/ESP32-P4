@@ -1,6 +1,6 @@
 # JC-ESP32P4-M3-DEV 开发板要点整合
 
-> 依据资料：`C3982-JC-ESP32P4-M3-DEV\JC-ESP32P4-M3-DEV` 下的规格书、入门手册、8 张原理图、IDF/Arduino Demo、烧录说明整理。
+> 依据资料：`D:\esp32project\ESP32-P4\C3982-JC-ESP32P4-M3-DEV\JC-ESP32P4-M3-DEV` 下的规格书、入门手册、8 张原理图、IDF/Arduino Demo、烧录说明整理。
 > 整理日期：2026-09-28
 
 ---

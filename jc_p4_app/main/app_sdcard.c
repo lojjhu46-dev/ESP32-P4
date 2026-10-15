@@ -34,7 +34,11 @@ esp_err_t app_sdcard_init(void)
     sd_power_on();
 
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
-    host.slot = SDMMC_HOST_SLOT_1;
+    /* ⚠️ TF 卡（CLK43/CMD44/D0-3=39..42）是 P4 SDMMC slot 0 的原生引脚映射。
+     * 原代码错配 SLOT_1——与 C6 的 SDIO（slot 1，GPIO14-19，esp_hosted 传输）
+     * 互踩：两次 init_slot 互相改引脚 + 共享主机状态，触发 NULL 队列断言
+     * （见 HANDOVER 第十九节）。TF=slot0，C6=slot1，各归其位。 */
+    host.slot = SDMMC_HOST_SLOT_0;
     host.max_freq_khz = SDMMC_FREQ_HIGHSPEED;   /* will drop automatically if not stable */
 
     sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();

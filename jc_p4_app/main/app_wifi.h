@@ -13,6 +13,17 @@ extern "C" {
  */
 esp_err_t app_wifi_init(void);
 
+/*
+ * 运行时配置 STA 凭据并立即连接（{"cmd":"wifi"} 用）。
+ * 写 NVS（FLASH 存储），断电保存；断线自动重连。
+ */
+void app_wifi_set_credentials(const char *ssid, const char *pass);
+
+/*
+ * STA 当前 IP 字符串（未关联返回 false）。结果帧 "wip" 字段用。
+ */
+bool app_wifi_get_ip(char *out, size_t len);
+
 #ifdef __cplusplus
 }
 #endif

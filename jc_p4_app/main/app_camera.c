@@ -15,6 +15,7 @@
 #include <sys/mman.h>
 #include <string.h>
 #include <errno.h>
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -42,6 +43,8 @@
 #define CAM_TASK_PRIO     6
 #define CAM_STATUS_US     1000000
 
+static esp_err_t cam_ctrl_set(uint32_t id, int32_t value);   /* 信箱执行用（实现见下） */
+
 static struct {
     int      fd;
     struct {
@@ -53,9 +56,280 @@ static struct {
     int      stride;
     uint32_t fourcc;
     volatile bool streaming;
+    bool     sensor_hflip;              /* 传感器 HMIRROR 已生效（软件镜像就不用做了） */
     uint32_t frames;
     uint32_t dropped;
 } s_cam = { .fd = -1 };
+
+/* ISP 设备（/dev/video20）：只用来设硬件白平衡（WBG 乘进 CCM）。
+   打开失败则白平衡退回 imgpipe 软件路径。 */
+static struct {
+    int fd;
+} s_isp = { .fd = -1 };
+
+/* ---------------- 写操作信箱 ----------------
+ * faceai（自动路径）投递 -> camera_task 在 QBUF 后执行。自旋锁保护合并字段：
+ * P4 双核，投递者与执行者可能真的并行。锁内只有几条赋值，无 ioctl。 */
+#define CAM_MREQ_FPS   0x1u
+#define CAM_MREQ_EXP   0x2u
+#define CAM_MREQ_GAIN  0x4u
+#define CAM_MREQ_WB    0x8u    /* ISP 硬件白平衡（/dev/video20，WBG 乘进 CCM） */
+#define CAM_MREQ_GAMMA 0x10u   /* ISP 硬件 gamma 曲线（低光提亮；0=禁用模块） */
+#define CAM_MREQ_BF    0x20u   /* ISP 硬件 BF 拜耳域降噪（level 0=禁用） */
+#define CAM_MREQ_CCM   0x40u   /* ISP 硬件 CCM 颜色校正（mix 千分比：0=禁用模块） */
+
+typedef struct {
+    int32_t fps, exp, gain;
+    int32_t wb_kr, wb_kb;       /* 千分比 */
+    int32_t gamma;              /* 千分比 gamma 参数（1000=线性，0=禁用模块） */
+    int32_t bf;                 /* BF level（0=禁用） */
+    int32_t ccm_mix;            /* CCM 混合千分比（0=禁用，1000=完整厂商标定矩阵） */
+} cam_mreq_args_t;
+
+static portMUX_TYPE s_mreq_mux = portMUX_INITIALIZER_UNLOCKED;
+static struct {
+    uint32_t mask;              /* 待执行的请求位；0 = 空 */
+    cam_mreq_args_t arg;
+} s_mreq;
+
+static void cam_mreq_post(uint32_t add_mask, const cam_mreq_args_t *a)
+{
+    if (!s_cam.streaming) {
+        return;                  /* 任务没在跑：丢弃（自动路径对失败无感知需求）*/
+    }
+    portENTER_CRITICAL(&s_mreq_mux);
+    if (add_mask & CAM_MREQ_FPS)  s_mreq.arg.fps = a->fps;
+    if (add_mask & CAM_MREQ_EXP)  s_mreq.arg.exp = a->exp;
+    if (add_mask & CAM_MREQ_GAIN) s_mreq.arg.gain = a->gain;
+    if (add_mask & CAM_MREQ_WB) {
+        s_mreq.arg.wb_kr = a->wb_kr;
+        s_mreq.arg.wb_kb = a->wb_kb;
+    }
+    if (add_mask & CAM_MREQ_GAMMA) s_mreq.arg.gamma = a->gamma;
+    if (add_mask & CAM_MREQ_BF)    s_mreq.arg.bf = a->bf;
+    if (add_mask & CAM_MREQ_CCM)   s_mreq.arg.ccm_mix = a->ccm_mix;
+    s_mreq.mask |= add_mask;
+    portEXIT_CRITICAL(&s_mreq_mux);
+}
+
+/* 在 /dev/video20 上设一个 esp_video ISP 自定义 control（p_u8 payload） */
+static int isp_set_ctrl(uint32_t id, const void *payload, uint8_t size)
+{
+    struct v4l2_ext_control ec;
+    memset(&ec, 0, sizeof(ec));
+    ec.id = id;
+    ec.p_u8 = (uint8_t *)payload;
+    struct v4l2_ext_controls ecs;
+    memset(&ecs, 0, sizeof(ecs));
+    ecs.ctrl_class = V4L2_CID_USER_CLASS;
+    ecs.count = 1;
+    ecs.controls = &ec;
+    return ioctl(s_isp.fd, VIDIOC_S_EXT_CTRLS, &ecs);
+}
+
+/* gamma 曲线的 16 个采样点 x：首点必须 >0、相邻差全为 2 的幂、末点=255
+   （IDF 驱动硬校验，esp_driver_isp/src/isp_gamma.c——x[0]=0 会被判 INVALID_ARG），
+   分布前密后疏——提亮主要作用于暗部 */
+static const uint8_t s_gamma_x[ISP_GAMMA_CURVE_POINTS_NUM] = {
+    1, 2, 4, 8, 16, 32, 64, 96, 128, 192, 224, 240, 248, 252, 254, 255
+};
+
+/* gammapermille: 0=禁用模块；1000=线性（模块开着但无提亮）；<1000=暗部提亮 */
+static void isp_apply_gamma(int gamma_permille)
+{
+    esp_video_isp_gamma_t g;
+    memset(&g, 0, sizeof(g));
+    if (gamma_permille <= 0) {
+        g.enable = false;
+    } else {
+        float gp = gamma_permille / 1000.0f;
+        if (gp > 1.0f) gp = 1.0f;            /* >1 是压暗，没意义 */
+        if (gp < 0.30f) gp = 0.30f;          /* 过强会丢暗部层次 */
+        g.enable = true;
+        /* 曲线语义（受控 A/B 实测确认，2026-10-01）：pt.x=输入位置、pt.y=输出值，
+           线性曲线完全透明。要实现 out = in^gp 的暗部提亮，直接 y = 255*(x/255)^gp。
+           （注意 x 网格首点必须 >0、相邻差为 2 的幂、末点=255，是驱动硬校验。） */
+        int prev_y = -1;
+        for (int i = 0; i < ISP_GAMMA_CURVE_POINTS_NUM; i++) {
+            g.points[i].x = s_gamma_x[i];
+            int y = (int)(255.0f * powf((float)s_gamma_x[i] / 255.0f, gp) + 0.5f);
+            if (y <= prev_y) {
+                y = prev_y + 1;              /* 保持单调 */
+            }
+            if (y > 255) {
+                y = 255;
+            }
+            if (i == ISP_GAMMA_CURVE_POINTS_NUM - 1) {
+                y = 255;                     /* 末点顶格 */
+            }
+            g.points[i].y = (uint8_t)y;
+            prev_y = y;
+        }
+    }
+    if (isp_set_ctrl(V4L2_CID_USER_ESP_ISP_GAMMA, &g, sizeof(g)) != 0) {
+        ESP_LOGW(TAG, "isp gamma %d set failed (errno %d)", gamma_permille, errno);
+    }
+}
+
+/* bf_level: 0=禁用；2..20（用 3..6 档）。矩阵取 IPA sc2336 调优的 level-3 模板 */
+static void isp_apply_bf(int bf_level)
+{
+    esp_video_isp_bf_t bf;
+    memset(&bf, 0, sizeof(bf));
+    if (bf_level <= 0) {
+        bf.enable = false;
+    } else {
+        if (bf_level < 2) bf_level = 2;
+        if (bf_level > 20) bf_level = 20;
+        static const uint8_t m[3][3] = { { 2, 4, 2 }, { 4, 5, 4 }, { 2, 4, 2 } };
+        bf.enable = true;
+        bf.level = (uint8_t)bf_level;
+        memcpy(bf.matrix, m, sizeof(m));
+    }
+    if (isp_set_ctrl(V4L2_CID_USER_ESP_ISP_BF, &bf, sizeof(bf)) != 0) {
+        ESP_LOGW(TAG, "isp bf %d set failed (errno %d)", bf_level, errno);
+    }
+}
+
+/* 厂商标定 CCM（esp_cam_sensor/sensors/sc2336/cfg/sc2336_default.json acc/ccm 原值）。
+ * 三行系数和均为 1.0 = 亮度守恒（灰/白不动，只校色相与饱和度），
+ * 对 AE/夜视阶梯的亮度判定无扰动。IPA 控制器关闭后这套参数从未下发过，
+ * 是白天颜色与人眼差距大的主要软件来源。 */
+static const float s_ccm_vendor[3][3] = {
+    { 1.408f, -0.094f, -0.314f },
+    { -0.130f, 1.280f, -0.150f },
+    { -0.072f, -0.173f, 1.245f },
+};
+
+/* ccm_mix 千分比：0=禁用 CCM 模块；1000=完整厂商标定矩阵；其他 = 与单位阵插值
+   （>1000 为过饱和方向，可用于逼近厂商 saturation 138 的意图）。
+   驱动要求矩阵元素范围 (-4, 4)，钳位兜底。独立硬件模块，与 WBG 白平衡互不影响。 */
+static void isp_apply_ccm(int mix)
+{
+    esp_video_isp_ccm_t ccm;
+    memset(&ccm, 0, sizeof(ccm));
+    if (mix <= 0) {
+        ccm.enable = false;
+    } else {
+        ccm.enable = true;
+        float k = mix / 1000.0f;
+        for (int i = 0; i < 3; i++) {
+            for (int j = 0; j < 3; j++) {
+                float v = (i == j ? 1.0f : 0.0f) + k * (s_ccm_vendor[i][j] - (i == j ? 1.0f : 0.0f));
+                if (v > 3.99f) v = 3.99f;
+                if (v < -3.99f) v = -3.99f;
+                ccm.matrix[i][j] = v;
+            }
+        }
+    }
+    if (isp_set_ctrl(V4L2_CID_USER_ESP_ISP_CCM, &ccm, sizeof(ccm)) != 0) {
+        ESP_LOGW(TAG, "isp ccm %d set failed (errno %d)", mix, errno);
+    }
+}
+
+/* 在 camera_task 的安全点调用（QBUF 之后）：此时没有别的 ioctl 在途 */
+static void camera_mailbox_run(void)
+{
+    uint32_t mask;
+    cam_mreq_args_t a;
+    portENTER_CRITICAL(&s_mreq_mux);
+    mask = s_mreq.mask;
+    a = s_mreq.arg;
+    s_mreq.mask = 0;
+    portEXIT_CRITICAL(&s_mreq_mux);
+
+    if (mask & CAM_MREQ_FPS) {
+        cam_ctrl_set(APP_CAM_CTL_FPS, a.fps);
+    }
+    if (mask & CAM_MREQ_EXP) {
+        cam_ctrl_set(V4L2_CID_EXPOSURE, a.exp);
+    }
+    if (mask & CAM_MREQ_GAIN) {
+        cam_ctrl_set(V4L2_CID_GAIN, a.gain);
+    }
+    if ((mask & CAM_MREQ_WB) && s_isp.fd >= 0) {
+        /* ISP 硬件白平衡：WBG 增益乘进 CCM 对角元，零 CPU 成本（原先软件 WB
+           是每帧 614KB 的 LUT 内存遍历，把 camera 任务占满过）。ISP 已在
+           streaming（csi streamon 时启动），esp_video 会 live 重配 CCM。 */
+        esp_video_isp_wb_t wb = {
+            .enable = true,
+            .red_gain = a.wb_kr / 1000.0f,
+            .blue_gain = a.wb_kb / 1000.0f,
+        };
+        if (isp_set_ctrl(V4L2_CID_USER_ESP_ISP_WB, &wb, sizeof(wb)) != 0) {
+            ESP_LOGW(TAG, "isp wb %d/%d set failed (errno %d)", (int)a.wb_kr, (int)a.wb_kb, errno);
+        }
+    }
+    if ((mask & CAM_MREQ_GAMMA) && s_isp.fd >= 0) {
+        isp_apply_gamma(a.gamma);
+    }
+    if ((mask & CAM_MREQ_BF) && s_isp.fd >= 0) {
+        isp_apply_bf(a.bf);
+    }
+    if ((mask & CAM_MREQ_CCM) && s_isp.fd >= 0) {
+        isp_apply_ccm(a.ccm_mix);
+    }
+}
+
+void app_camera_post_exp_gain(int32_t exp, int32_t gain)
+{
+    cam_mreq_args_t a = { .exp = exp, .gain = gain };
+    cam_mreq_post(CAM_MREQ_EXP | CAM_MREQ_GAIN, &a);
+}
+
+void app_camera_post_fps(int32_t fps)
+{
+    cam_mreq_args_t a = { .fps = fps };
+    cam_mreq_post(CAM_MREQ_FPS, &a);
+}
+
+bool app_camera_post_wb(int32_t wkr, int32_t wkb)
+{
+    if (s_isp.fd < 0) {
+        return false;
+    }
+    cam_mreq_args_t a = { .wb_kr = wkr, .wb_kb = wkb };
+    cam_mreq_post(CAM_MREQ_WB, &a);
+    return true;
+}
+
+/* gamma_permille: 1000=线性 / <1000=提亮 / 0=禁用；返回 false = ISP 通道不可用 */
+bool app_camera_post_gamma(int32_t gamma_permille)
+{
+    if (s_isp.fd < 0) {
+        return false;
+    }
+    cam_mreq_args_t a = { .gamma = gamma_permille };
+    cam_mreq_post(CAM_MREQ_GAMMA, &a);
+    return true;
+}
+
+/* bf_level: 0=禁用，2..20（app 用 3..6） */
+bool app_camera_post_bf(int32_t bf_level)
+{
+    if (s_isp.fd < 0) {
+        return false;
+    }
+    cam_mreq_args_t a = { .bf = bf_level };
+    cam_mreq_post(CAM_MREQ_BF, &a);
+    return true;
+}
+
+/* ccm_mix: 0=禁用 CCM 模块，1000=完整厂商标定矩阵（isp_apply_ccm 注释） */
+bool app_camera_post_ccm(int32_t ccm_mix)
+{
+    if (s_isp.fd < 0) {
+        return false;
+    }
+    cam_mreq_args_t a = { .ccm_mix = ccm_mix };
+    cam_mreq_post(CAM_MREQ_CCM, &a);
+    return true;
+}
+
+bool app_camera_wb_available(void)
+{
+    return s_isp.fd >= 0;
+}
 
 /* 持续采集：DQBUF(阻塞) -> publish_raw(拷贝进管道槽) -> QBUF */
 static void camera_task(void *arg)
@@ -96,6 +370,10 @@ static void camera_task(void *arg)
             break;
         }
 
+        /* 自动路径的写请求（AE 调节 / auto_fps 切换）在这里串行执行：
+           与取流同任务、与运动估计/降噪的大数据处理不同时，无跨任务 ioctl 并发 */
+        camera_mailbox_run();
+
         int64_t now = esp_timer_get_time();
         if (now - win >= CAM_STATUS_US) {
             float fps = (float)win_cnt * 1000000.0f / (float)(now - win);
@@ -116,6 +394,12 @@ static void camera_task(void *arg)
 bool app_camera_ready(void)
 {
     return s_cam.streaming && s_cam.fd >= 0;
+}
+
+/* 传感器 HMIRROR 是否已生效（imgpipe 据此跳过软件镜像，省一次全帧内存遍历） */
+bool app_camera_sensor_hflip(void)
+{
+    return s_cam.sensor_hflip;
 }
 
 /* ---------------- V4L2 controls（曝光/增益/ISP 亮度）---------------- */
@@ -471,11 +755,53 @@ esp_err_t app_camera_init(void)
         ESP_LOGW(TAG, "set default gain %d failed", CONFIG_APP_CAM_DEF_GAIN);
     }
 
+    /* 镜像走传感器 HMIRROR（本地 patch 后 set_ext_ctrls_to_sensor 已接通，sc2336 驱动
+       有 set 分支）：在数据源头翻转，AI/回传天然一致，且省掉 imgpipe 每帧一次的
+       软件行内镜像内存遍历（640x480 约省 8~10ms/帧）。
+       ⚠️ 只信 SET 的返回值——sc2336 驱动的 get 分支没实现（get 必失败），拿 GET
+       验证会把 SET 成功也误判成不可用。 */
+    s_cam.sensor_hflip = false;
+#if CONFIG_APP_CAM_HFLIP
+    if (app_camera_set_sensor(APP_CAM_CTL_HMIRROR, 1) == ESP_OK) {
+        s_cam.sensor_hflip = true;
+        ESP_LOGI(TAG, "sensor hmirror ON (software hflip disabled)");
+    } else {
+        ESP_LOGW(TAG, "sensor hmirror unavailable, software hflip stays");
+    }
+#endif
+
+    /* ISP 设备：硬件白平衡入口（esp_video_init 已无条件创建 /dev/video20） */
+    s_isp.fd = open("/dev/video20", O_RDWR);
+    if (s_isp.fd < 0) {
+        ESP_LOGW(TAG, "open /dev/video20 failed (%d), WB stays software", errno);
+    }
+
     s_cam.streaming = true;
-    if (xTaskCreate(camera_task, "camera", CAM_TASK_STACK, NULL, CAM_TASK_PRIO, NULL) != pdPASS) {
+    /* 钉到 CPU1：camera 任务每帧 ~600KB 拷贝 + 后处理（约 15~24ms CPU），之前与
+       faceai(推理 ~20ms/帧)、imgpipe、isp_task(IPA 控制器开时 prio 11) 全挤在 CPU0，
+       实测 CPU0 饱和 -> 关 IPA 控制器后 faceai 被饿到模型加载卡死 + IDLE0 触发 WDT。
+       CPU1 基本空闲，摄像头整条采集/后处理链挪过去后 AI 独占 CPU0。 */
+    if (xTaskCreatePinnedToCore(camera_task, "camera", CAM_TASK_STACK, NULL,
+                                CAM_TASK_PRIO, NULL, CONFIG_APP_CAM_CORE) != pdPASS) {
         s_cam.streaming = false;
         app_status_set(APP_MOD_CAM, false, "task fail");
         return ESP_FAIL;
+    }
+
+    /* 初始白平衡：ISP 硬件可用就走 WBG（软件路径保持 1000=不二次校正），
+       否则维持 imgpipe 的软件默认值（init 里已设 CONFIG 默认） */
+    if (s_isp.fd >= 0) {
+        cam_mreq_args_t a = { .wb_kr = CONFIG_APP_CAM_WB_KR, .wb_kb = CONFIG_APP_CAM_WB_KB };
+        cam_mreq_post(CAM_MREQ_WB, &a);
+        ESP_LOGI(TAG, "white balance -> ISP hardware WBG (%d/%d permille)",
+                 CONFIG_APP_CAM_WB_KR, CONFIG_APP_CAM_WB_KB);
+        /* 初始 CCM：IPA 控制器关闭后厂商标定矩阵从未下发（白天色偏主因），
+           随 WB 一起在 camera_task 安全点下发；mix=0 时 CCM 模块保持禁用 */
+#if CONFIG_APP_CAM_CCM_MIX > 0
+        cam_mreq_args_t c = { .ccm_mix = CONFIG_APP_CAM_CCM_MIX };
+        cam_mreq_post(CAM_MREQ_CCM, &c);
+        ESP_LOGI(TAG, "CCM -> ISP hardware (mix %d permille)", CONFIG_APP_CAM_CCM_MIX);
+#endif
     }
 
     app_status_set(APP_MOD_CAM, true, "%dx%d streaming", s_cam.width, s_cam.height);

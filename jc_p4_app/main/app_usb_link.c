@@ -42,6 +42,7 @@ typedef struct {
     volatile bool cdc_up;        /* USB 主机在不在（tinyusb ATTACHED/DETACHED） */
     TickType_t send_fail_tick;   /* 发送失败日志限流 */
     void    (*cmd_cb)(const char *json, uint32_t len);
+    void    (*blob_cb)(const uint8_t *data, uint32_t len);   /* 0x06 块数据（F10） */
     uint32_t  dropped;
 
     /* latest complete JPEG frame slot (window=1 protocol) */
@@ -182,6 +183,9 @@ static void parser_feed(uint8_t b)
         if (s_lk.crc_rx == s_lk.crc_calc) {
             if (s_lk.f_type == JCL_TYPE_CMD && s_lk.cmd_cb) {
                 s_lk.cmd_cb((const char *)s_lk.f_buf, s_lk.f_len);
+            } else if (s_lk.f_type == JCL_TYPE_BLOB && s_lk.blob_cb) {
+                /* F10：块数据回调（rx 任务上下文，payload 返回后即释放） */
+                s_lk.blob_cb(s_lk.f_buf, s_lk.f_len);
             } else if (s_lk.f_type == JCL_TYPE_JPEG) {
                 if (s_lk.jpeg_buf) heap_caps_free(s_lk.jpeg_buf);
                 s_lk.jpeg_buf = s_lk.f_buf;
@@ -361,6 +365,11 @@ int app_usb_link_recv(uint8_t *type_out, void *payload, uint32_t max_len)
 void app_usb_link_set_cmd_cb(void (*cb)(const char *json, uint32_t len))
 {
     s_lk.cmd_cb = cb;
+}
+
+void app_usb_link_set_blob_cb(void (*cb)(const uint8_t *data, uint32_t len))
+{
+    s_lk.blob_cb = cb;
 }
 
 esp_err_t app_usb_link_init(void)

@@ -1,8 +1,10 @@
 /*
  * ui_shared.c —— 同源 UI 实现（纯 LVGL v9）
  *
- * 布局（弹性列）：
- *   [状态栏 36] [图像 480x360 + 检测框] [结果 30] [名单 grow] [按钮 2x4] [日志 68]
+ * 布局（弹性列，480x800 竖屏）：
+ *   [状态栏 30 + 模式徽标] [预览 flex_grow（等比 letterbox + 检测框）]
+ *   [结果 16] [事件 16] [按钮 5 行 x38：识别x2 / 模式 / 帧率 / 画质]
+ *   [gain/exp 滑块 28x2] [名单 14] [日志 56]
  * JPEG 解码用 lvgl 内置的 tjpgd（直接解码到自管 RGB888 缓冲），
  * 不走 LVGL 的 FS/MEMFS 解码路径 —— 避免依赖 lv_conf 的 FS 开关。
  */
@@ -15,8 +17,6 @@
 #include "lvgl.h"
 #include "lvgl/src/libs/tjpgd/tjpgd.h"
 
-#define IMG_W           480
-#define IMG_H           300        /* 让出 60px 给第 4 行"帧率档位"按钮 */
 #define MAX_BOXES       6
 #define LOG_LINES       3
 #define UI_NAME_MAX     24
@@ -24,6 +24,7 @@
 #define C_BG            0x0E1116
 #define C_PANEL         0x1A2029
 #define C_ACCENT        0x22C1A4
+#define C_NIGHT         0xE8A33D    /* 夜视档徽标（琥珀） */
 #define C_WARN          0xE5534B
 #define C_TEXT          0xE6EDF3
 #define C_DIM           0x8B949E
@@ -41,10 +42,15 @@ static struct {
     lv_obj_t *img_holder;
     lv_obj_t *box[MAX_BOXES];
     lv_obj_t *box_label[MAX_BOXES];
+    char      box_name[MAX_BOXES][UI_NAME_MAX]; /* F7/F8: 每框名字（boxes 第 5 位） */
+    float     box_sim[MAX_BOXES];               /* F7/F8: 每框相似度（boxes 第 6 位） */
     lv_obj_t *no_signal;
+    float     disp_scale;      /* 预览统一缩放（原图 px -> 显示 px），检测框定位用 */
+    float     disp_ox, disp_oy; /* letterbox 偏移 */
 
     /* 状态栏 / 结果 / 名单 / 日志 */
-    lv_obj_t *lbl_link, *lbl_stream, *lbl_result, *lbl_event, *lbl_list, *lbl_log;
+    lv_obj_t *lbl_link, *lbl_mode, *lbl_stream, *lbl_result, *lbl_event, *lbl_list, *lbl_log;
+    int       night_on, night_tier;   /* 板端夜视阶梯状态（徽标显示用；未收到字段前 0=不显示） */
 
     /* 摄像头参数（滑块 + 快捷按钮） */
     lv_obj_t *sl_gain, *sl_exp, *lbl_gain, *lbl_exp, *btn_mirror, *lbl_mirror, *lbl_wb;
@@ -57,12 +63,30 @@ static struct {
     lv_obj_t *lbl_dn;
     int       dn;
 
+    /* 自动帧率（运动自适应 15/50fps）*/
+    lv_obj_t *lbl_auto;
+    bool      auto_on;
+
+    /* AE/AWB 自动模式（板端 app_camauto 闭环） */
+    lv_obj_t *lbl_ae, *lbl_awb;
+    bool      ae_on, awb_on;
+
     /* 按钮 */
     lv_obj_t *btn_src, *lbl_src, *btn_stream, *lbl_stream_btn;
+    lv_obj_t *btn_autoall;     /* "Auto All"：一键回全自动，全自动时高亮 */
 
     /* 弹窗输入 */
     lv_obj_t *kb;
     lv_obj_t *mbox;
+    /* F8：注册弹窗（shots 选择 + 采集进度态） */
+    lv_obj_t *ta_name;             /* 名字输入框 */
+    lv_obj_t *btn_ok, *btn_cancel; /* 弹窗按钮（注册中要隐藏 OK / Cancel 改发 stop） */
+    lv_obj_t *row_shots;           /* shots 选择行（1/3/5） */
+    lv_obj_t *lbl_prog;            /* 采集进度标签 */
+    lv_obj_t *bar_prog;            /* 采集进度条 */
+    int       reg_shots;           /* 选中的采集帧数（1/3/5，默认 3） */
+    char      reg_cmd[16];         /* 弹窗命令（register/delete） */
+    bool      enrolling;           /* 弹窗处于@@Q@@注册中@@Q@@态（进度显示，Cancel=stop） */
 
     bool connected;
     bool stream_on;
@@ -113,8 +137,10 @@ static bool json_str(const char *js, const char *key, char *out, size_t out_sz)
     return true;
 }
 
-/* boxes: [[x1,y1,x2,y2],...] -> 归一化到 0..1 */
-static int json_boxes(const char *js, float out[][4], int max)
+/* boxes: [[x1,y1,x2,y2],...] 或 F7 扩展 [[x1,y1,x2,y2,\"name\",sim],...] -> 归一化到 0..1
+ * （names/sims 可为 NULL：调用方不关心每框名字/相似度时只取坐标） */
+static int json_boxes(const char *js, float out[][4], char names[][UI_NAME_MAX],
+                      float sims[], int max)
 {
     const char *p = json_value(js, "boxes");
     if (!p || *p != '[') return 0;
@@ -135,6 +161,30 @@ static int json_boxes(const char *js, float out[][4], int max)
         }
         if (k == 4) {
             memcpy(out[n], v, sizeof(v));
+            if (names) names[n][0] = '\0';
+            if (sims) sims[n] = 0;
+            /* F7 扩展位：第 5 位名字（字符串）、第 6 位相似度（数字） */
+            while (*q && *q != ']') {
+                if (*q == '\"') {
+                    q++;
+                    const char *e = strchr(q, '\"');
+                    if (!e) break;
+                    size_t len = (size_t)(e - q);
+                    if (names) {
+                        if (len >= UI_NAME_MAX) len = UI_NAME_MAX - 1;
+                        memcpy(names[n], q, len);
+                        names[n][len] = '\0';
+                    }
+                    q = e + 1;
+                } else if (*q == ',') {
+                    q++;
+                    if (*q == '\"') continue;
+                    if (sims) sims[n] = (float)atof(q);
+                    while (*q && *q != ',' && *q != ']') q++;
+                } else {
+                    q++;
+                }
+            }
             n++;
         }
         while (*q && *q != ']') q++;
@@ -144,32 +194,55 @@ static int json_boxes(const char *js, float out[][4], int max)
     return n;
 }
 
-/* lib: ["a","b"] -> "a, b" */
+/* lib: ["a","b"] + lib_feats:[3,2]（F8 平行数组）-> "a(3), b(2)"（无则退化 "a, b"） */
 static void json_lib(const char *js, char *out, size_t out_sz)
 {
     out[0] = '\0';
     const char *p = strstr(js ? js : "", "\"lib\":[");
     if (!p) return;
     p += 7;
-    size_t used = 0;
-    while (*p && *p != ']') {
+    char names[16][32];
+    int  feats[16];
+    int  n = 0;
+    while (*p && *p != ']' && n < 16) {
         if (*p == '"') {
             p++;
             const char *e = strchr(p, '"');
             if (!e) break;
-            size_t n = (size_t)(e - p);
-            if (used + n + 3 < out_sz) {
-                if (used) {
-                    out[used++] = ',';
-                    out[used++] = ' ';
-                }
-                memcpy(out + used, p, n);
-                used += n;
-                out[used] = '\0';
-            }
+            size_t len = (size_t)(e - p);
+            if (len >= sizeof(names[0])) len = sizeof(names[0]) - 1;
+            memcpy(names[n], p, len);
+            names[n][len] = '\0';
+            feats[n] = -1;                       /* 无 lib_feats 时 -1 = 不显示计数 */
+            n++;
             p = e + 1;
         } else {
             p++;
+        }
+    }
+    const char *pf = strstr(js, "\"lib_feats\":[");
+    if (pf) {
+        pf += strlen("\"lib_feats\":[");  /* 14：模式串长度；偏移少加 2 会 atoi 到 :[ 得 0 */
+        for (int i = 0; i < n && *pf && *pf != ']'; i++) {
+            while (*pf == ',' || *pf == ' ') pf++;
+            if (*pf == ']' || !*pf) break;
+            feats[i] = atoi(pf);
+            while (*pf && *pf != ',' && *pf != ']') pf++;
+        }
+    }
+    size_t used = 0;
+    for (int i = 0; i < n; i++) {
+        char item[44];
+        int m = (feats[i] >= 0) ? snprintf(item, sizeof(item), "%s(%d)", names[i], feats[i])
+                                : snprintf(item, sizeof(item), "%s", names[i]);
+        if (used + (size_t)m + 3 < out_sz) {
+            if (used) {
+                out[used++] = ',';
+                out[used++] = ' ';
+            }
+            memcpy(out + used, item, (size_t)m);
+            used += (size_t)m;
+            out[used] = '\0';
         }
     }
 }
@@ -242,21 +315,20 @@ static bool decode_jpeg(const uint8_t *data, uint32_t len)
     return true;
 }
 
-/* 检测框：按显示比例摆放（板端 box 是原图像素坐标）；name 只标在最大的一帧首个框上 */
+/* 检测框：按预览的统一缩放 + letterbox 偏移摆放（板端 box 是原图像素坐标）。
+ * F8：有每框名字（F7 boxes 第 5/6 位）就画在该框上并带相似度；无则首框回退顶层 match。 */
 static void update_boxes(const float box[][4], int n, const char *name)
 {
     for (int i = 0; i < MAX_BOXES; i++) {
-        if (i >= n || s_ui.rgb_w <= 0) {
+        if (i >= n || s_ui.rgb_w <= 0 || s_ui.disp_scale <= 0) {
             lv_obj_add_flag(s_ui.box[i], LV_OBJ_FLAG_HIDDEN);
             lv_obj_add_flag(s_ui.box_label[i], LV_OBJ_FLAG_HIDDEN);
             continue;
         }
-        float sx = (float)IMG_W / (float)s_ui.rgb_w;
-        float sy = (float)IMG_H / (float)s_ui.rgb_h;
-        int x1 = (int)(box[i][0] * sx);
-        int y1 = (int)(box[i][1] * sy);
-        int x2 = (int)(box[i][2] * sx);
-        int y2 = (int)(box[i][3] * sy);
+        int x1 = (int)(box[i][0] * s_ui.disp_scale + s_ui.disp_ox);
+        int y1 = (int)(box[i][1] * s_ui.disp_scale + s_ui.disp_oy);
+        int x2 = (int)(box[i][2] * s_ui.disp_scale + s_ui.disp_ox);
+        int y2 = (int)(box[i][3] * s_ui.disp_scale + s_ui.disp_oy);
         if (x2 <= x1 || y2 <= y1) {
             lv_obj_add_flag(s_ui.box[i], LV_OBJ_FLAG_HIDDEN);
             lv_obj_add_flag(s_ui.box_label[i], LV_OBJ_FLAG_HIDDEN);
@@ -266,8 +338,20 @@ static void update_boxes(const float box[][4], int n, const char *name)
         lv_obj_set_pos(s_ui.box[i], x1, y1);
         lv_obj_set_size(s_ui.box[i], x2 - x1, y2 - y1);
 
-        if (name && name[0]) {
-            lv_label_set_text(s_ui.box_label[i], name);
+        const char *lbl = NULL;
+        char buf[UI_NAME_MAX + 10];
+        if (s_ui.box_name[i][0]) {
+            if (s_ui.box_sim[i] > 0) {
+                snprintf(buf, sizeof(buf), "%s %.2f", s_ui.box_name[i], s_ui.box_sim[i]);
+                lbl = buf;
+            } else {
+                lbl = s_ui.box_name[i];
+            }
+        } else if (i == 0 && name && name[0]) {
+            lbl = name;
+        }
+        if (lbl) {
+            lv_label_set_text(s_ui.box_label[i], lbl);
             lv_obj_set_pos(s_ui.box_label[i], x1, y1 > 18 ? y1 - 18 : y1 + 2);
             lv_obj_remove_flag(s_ui.box_label[i], LV_OBJ_FLAG_HIDDEN);
         } else {
@@ -292,52 +376,204 @@ static void close_input(void)
         s_ui.kb = NULL;
     }
     if (s_ui.mbox) {
-        lv_obj_delete(s_ui.mbox);
+        /* 必须用 lv_msgbox_close：lv_msgbox_create(NULL) 会在 lv_layer_top() 上自动建一块
+         * 100%x100% 的可点击背板当 mbox 的父对象，直接 lv_obj_delete(mbox) 只删 mbox，
+         * 全屏遮罩会永久残留（主 UI 被盖住 + 点不动）。lv_msgbox_close 会连父背板一起删。 */
+        lv_msgbox_close(s_ui.mbox);
         s_ui.mbox = NULL;
     }
+    /* 这些控件都是 mbox 的子对象，随 mbox 一起销毁 → 指针必须清空，别留着悬空 */
+    s_ui.ta_name = NULL;
+    s_ui.row_shots = NULL;
+    s_ui.lbl_prog = NULL;
+    s_ui.bar_prog = NULL;
+    s_ui.btn_ok = NULL;
+    s_ui.btn_cancel = NULL;
+}
+
+static void input_ok_cb(lv_event_t *e);
+static void input_cancel_cb(lv_event_t *e);
+
+/* F8：shots 单选（1/3/5）——点选即高亮并记入 s_ui.reg_shots */
+static void shots_sel_cb(lv_event_t *e)
+{
+    lv_obj_t *btn = (lv_obj_t *)lv_event_get_target(e);
+    s_ui.reg_shots = (int)(intptr_t)lv_obj_get_user_data(btn);
+    uint32_t n = lv_obj_get_child_count(s_ui.row_shots);
+    for (uint32_t i = 0; i < n; i++) {
+        lv_obj_t *b = lv_obj_get_child(s_ui.row_shots, i);
+        /* 只有三个选项按钮带 user_data；"Shots:" 标题标签没有 → 跳过 */
+        if (!b || !lv_obj_get_user_data(b)) continue;
+        bool on = (b == btn);
+        lv_obj_set_style_bg_color(b, lv_color_hex(on ? C_ACCENT : C_PANEL), 0);
+        lv_obj_t *lbl = lv_obj_get_child(b, 0);
+        if (lbl) {
+            lv_obj_set_style_text_color(lbl, lv_color_hex(on ? C_BG : C_TEXT), 0);
+        }
+    }
+}
+
+/* 名字为空/纯空白？—— OK 置灰与提交都走这一个判据。
+   用 > ' ' 判非空白，免 include ctype.h（本文件要与板端同源） */
+static bool name_blank(const char *s)
+{
+    if (!s) return true;
+    for (; *s; s++) {
+        if ((unsigned char)*s > ' ') return false;
+    }
+    return true;
+}
+
+/* 输入框实时校验：空/纯空白 → OK 置灰不可点，有内容才放行（F8b） */
+static void ta_changed_cb(lv_event_t *e)
+{
+    lv_obj_t *ta = (lv_obj_t *)lv_event_get_target(e);
+    lv_obj_t *ok = (lv_obj_t *)lv_event_get_user_data(e);
+    if (!ok) return;
+    if (name_blank(lv_textarea_get_text(ta))) {
+        lv_obj_add_state(ok, LV_STATE_DISABLED);
+    } else {
+        lv_obj_remove_state(ok, LV_STATE_DISABLED);
+    }
+}
+
+/* 提交（OK 按钮与键盘右下 ✓ 共用）。名字为空/纯空白时什么都不做、弹窗保持打开 */
+static void do_input_ok(const char *cmd, lv_obj_t *ta)
+{
+    const char *name = ta ? lv_textarea_get_text(ta) : NULL;
+    if (name_blank(name)) return;
+
+    char js[160];
+    if (!strcmp(cmd, "register")) {
+        /* F1：多帧注册（shots 由弹窗选择，1=旧行为） */
+        snprintf(js, sizeof(js), "{\"cmd\":\"register\",\"id\":\"%s\",\"shots\":%d}",
+                 name, s_ui.reg_shots);
+    } else {
+        snprintf(js, sizeof(js), "{\"cmd\":\"%s\",\"id\":\"%s\"}", cmd, name);
+    }
+    send_cmd(js);
+    ui_shared_add_log(cmd[0] == 'r' ? "register: face the camera" : "delete sent");
+    /* F8：多帧注册时弹窗转"注册中"态（收键盘/输入，显示进度条），
+     * registered/error 事件自动关闭；Cancel 改发 stop（取消采集）。 */
+    if (!strcmp(cmd, "register") && s_ui.reg_shots > 1 && s_ui.mbox) {
+        s_ui.enrolling = true;
+        if (s_ui.kb) {
+            lv_obj_delete(s_ui.kb);
+            s_ui.kb = NULL;
+        }
+        if (s_ui.ta_name) lv_obj_add_flag(s_ui.ta_name, LV_OBJ_FLAG_HIDDEN);
+        if (s_ui.row_shots) lv_obj_add_flag(s_ui.row_shots, LV_OBJ_FLAG_HIDDEN);
+        if (s_ui.btn_ok) lv_obj_add_flag(s_ui.btn_ok, LV_OBJ_FLAG_HIDDEN);
+        if (s_ui.lbl_prog) {
+            lv_label_set_text_fmt(s_ui.lbl_prog, "collected 0/%d - stay in view", s_ui.reg_shots);
+            lv_obj_remove_flag(s_ui.lbl_prog, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (s_ui.bar_prog) {
+            lv_bar_set_range(s_ui.bar_prog, 0, s_ui.reg_shots);
+            lv_bar_set_value(s_ui.bar_prog, 0, LV_ANIM_OFF);
+            lv_obj_remove_flag(s_ui.bar_prog, LV_OBJ_FLAG_HIDDEN);
+        }
+        return;                      /* 弹窗保持打开（进度态） */
+    }
+    close_input();
 }
 
 static void input_ok_cb(lv_event_t *e)
 {
-    lv_obj_t *ta = (lv_obj_t *)lv_event_get_user_data(e);
-    const char *cmd = (const char *)lv_obj_get_user_data(lv_event_get_target(e));
-    const char *name = lv_textarea_get_text(ta);
-    if (name && name[0]) {
-        char js[128];
-        snprintf(js, sizeof(js), "{\"cmd\":\"%s\",\"id\":\"%s\"}", cmd, name);
-        send_cmd(js);
-        ui_shared_add_log(cmd[0] == 'r' ? "register: 请正对摄像头" : "delete sent");
-    }
-    close_input();
+    do_input_ok((const char *)lv_obj_get_user_data(lv_event_get_target(e)),
+                (lv_obj_t *)lv_event_get_user_data(e));
+}
+
+/* 键盘右下角的 ✓ 键 = OK（键盘自身不带 target 的 cmd，用弹窗记录的 reg_cmd） */
+static void kb_ready_cb(lv_event_t *e)
+{
+    do_input_ok(s_ui.reg_cmd, (lv_obj_t *)lv_event_get_user_data(e));
 }
 
 static void input_cancel_cb(lv_event_t *e)
 {
     (void)e;
+    if (s_ui.enrolling) {
+        send_cmd("{\"cmd\":\"stop\"}");   /* 板端：stop 取消未完成的注册采集 */
+        ui_shared_add_log("register: cancelled");
+    }
+    s_ui.enrolling = false;
     close_input();
 }
 
 static void open_input(const char *title, const char *cmd)
 {
     close_input();
+    s_ui.enrolling = false;
+    s_ui.reg_shots = 3;
+    snprintf(s_ui.reg_cmd, sizeof(s_ui.reg_cmd), "%s", cmd);
     s_ui.mbox = lv_msgbox_create(NULL);
     lv_msgbox_add_title(s_ui.mbox, title);
     lv_obj_t *ta = lv_textarea_create(s_ui.mbox);
     lv_textarea_set_one_line(ta, true);
     lv_textarea_set_placeholder_text(ta, "name");
     lv_obj_set_width(ta, lv_pct(80));
+    s_ui.ta_name = ta;
 
     lv_obj_t *ok = lv_msgbox_add_footer_button(s_ui.mbox, "OK");
     lv_obj_t *cancel = lv_msgbox_add_footer_button(s_ui.mbox, "Cancel");
     lv_obj_set_user_data(ok, (void *)cmd);
     lv_obj_add_event_cb(ok, input_ok_cb, LV_EVENT_CLICKED, ta);
     lv_obj_add_event_cb(cancel, input_cancel_cb, LV_EVENT_CLICKED, NULL);
+    /* F8b：输入框为空/纯空白时 OK 置灰（点不动 = 提交不了空名字） */
+    lv_obj_add_state(ok, LV_STATE_DISABLED);
+    lv_obj_add_event_cb(ta, ta_changed_cb, LV_EVENT_VALUE_CHANGED, ok);
+    s_ui.btn_ok = ok;
+    s_ui.btn_cancel = cancel;
 
-    s_ui.kb = lv_keyboard_create(lv_screen_active());
+    /* F8：shots 选择行（1/3/5，仅注册；默认 3 高亮）+ 进度控件（初始隐藏） */
+    s_ui.row_shots = NULL;
+    s_ui.lbl_prog = NULL;
+    s_ui.bar_prog = NULL;
+    if (!strcmp(cmd, "register")) {
+        static const char *lbls[3] = { "1", "3", "5" };
+        static const int vals[3] = { 1, 3, 5 };
+        s_ui.row_shots = lv_obj_create(s_ui.mbox);
+        lv_obj_set_size(s_ui.row_shots, lv_pct(100), 36);
+        lv_obj_set_flex_flow(s_ui.row_shots, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(s_ui.row_shots, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_column(s_ui.row_shots, 6, 0);
+        lv_obj_set_style_border_width(s_ui.row_shots, 0, 0);
+        lv_obj_set_style_bg_opa(s_ui.row_shots, LV_OPA_TRANSP, 0);
+        /* F8b：这组按钮 = 注册时采集的人脸帧数（直接发给板端的 shots 参数）——
+           裸数字"1/3/5"看不出含义，故加英文标题 */
+        lv_obj_t *l_cap = lv_label_create(s_ui.row_shots);
+        lv_label_set_text(l_cap, "Shots:");
+        lv_obj_set_style_text_color(l_cap, lv_color_hex(C_DIM), 0);
+        for (int i = 0; i < 3; i++) {
+            lv_obj_t *b = lv_button_create(s_ui.row_shots);
+            lv_obj_set_size(b, 50, 30);
+            lv_obj_set_user_data(b, (void *)(intptr_t)vals[i]);
+            lv_obj_add_event_cb(b, shots_sel_cb, LV_EVENT_CLICKED, NULL);
+            lv_obj_t *l = lv_label_create(b);
+            lv_label_set_text(l, lbls[i]);
+            lv_obj_center(l);
+            if (vals[i] == s_ui.reg_shots) {
+                lv_obj_set_style_bg_color(b, lv_color_hex(C_ACCENT), 0);
+                lv_obj_set_style_text_color(l, lv_color_hex(C_BG), 0);
+            }
+        }
+        s_ui.lbl_prog = lv_label_create(s_ui.mbox);
+        lv_label_set_text(s_ui.lbl_prog, "");
+        lv_obj_add_flag(s_ui.lbl_prog, LV_OBJ_FLAG_HIDDEN);
+        s_ui.bar_prog = lv_bar_create(s_ui.mbox);
+        lv_obj_set_size(s_ui.bar_prog, lv_pct(80), 10);
+        lv_obj_add_flag(s_ui.bar_prog, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    /* 键盘必须建在 lv_layer_top()（与 msgbox 自动背板同层、且创建在后）：
+       msgbox_create(NULL) 的背板是全屏可点击对象，建在屏幕层的键盘会被它整个吞掉点击 */
+    s_ui.kb = lv_keyboard_create(lv_layer_top());
     lv_keyboard_set_textarea(s_ui.kb, ta);
     lv_obj_set_size(s_ui.kb, lv_pct(100), 240);
     lv_obj_align(s_ui.kb, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_move_foreground(s_ui.mbox);
+    lv_obj_move_foreground(s_ui.kb);
+    lv_obj_add_event_cb(s_ui.kb, kb_ready_cb, LV_EVENT_READY, ta);  /* ✓ 键 = OK */
 }
 
 /* ---------------- 增益/曝光滑块（松手才发命令，避免拖动时刷屏） ---------------- */
@@ -349,9 +585,48 @@ static void slider_changed_cb(lv_event_t *e)
                           is_gain ? "gain %d" : "exp %d", (int)lv_slider_get_value(sl));
 }
 
+/* 滑块标签统一刷新：AE 开着时带 "(auto)" 后缀（三个写标签的地方都走这里，
+   否则结果帧回写会把后缀抹掉） */
+static void slider_label_refresh(void)
+{
+    const char *sfx = s_ui.ae_on ? " (auto)" : "";
+    if (s_ui.lbl_gain) {
+        lv_label_set_text_fmt(s_ui.lbl_gain, "gain %d%s", s_ui.gain, sfx);
+    }
+    if (s_ui.lbl_exp) {
+        lv_label_set_text_fmt(s_ui.lbl_exp, "exp %d%s", s_ui.exp_val, sfx);
+    }
+}
+
+/* AE 自动曝光开着 -> 滑块置灰（视觉提示"自动中"，仍可点按） */
+static void sliders_auto_hint(bool ae_on)
+{
+    lv_obj_t *sls[2] = { s_ui.sl_gain, s_ui.sl_exp };
+    for (int i = 0; i < 2; i++) {
+        if (!sls[i]) continue;
+        if (ae_on) {
+            lv_obj_add_state(sls[i], LV_STATE_DISABLED);
+        } else {
+            lv_obj_remove_state(sls[i], LV_STATE_DISABLED);
+        }
+    }
+    slider_label_refresh();
+}
+
 static void slider_pressed_cb(lv_event_t *e)
 {
     (void)e;
+    /* AE 开着时用户动滑块 = 要手动接管：先退 AE（板端手动优先本来也会退，
+       这里让 UI 的 AE 按钮与置灰状态立即跟上），再正常拖动 */
+    if (s_ui.ae_on) {
+        s_ui.ae_on = false;
+        if (s_ui.lbl_ae) {
+            lv_label_set_text(s_ui.lbl_ae, "AE OFF");
+        }
+        sliders_auto_hint(false);
+        send_cmd("{\"cmd\":\"cam\",\"ae\":false}");
+        ui_shared_add_log("manual slider -> AE off");
+    }
     s_ui.dragging = true;
 }
 
@@ -377,7 +652,7 @@ static lv_obj_t *make_slider_row(lv_obj_t *parent, const char *label_text, int m
 {
     lv_obj_t *row = lv_obj_create(parent);
     lv_obj_set_width(row, lv_pct(100));
-    lv_obj_set_height(row, 36);
+    lv_obj_set_height(row, 28);
     lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(row, 0, 0);
     lv_obj_set_style_pad_all(row, 0, 0);
@@ -388,7 +663,7 @@ static lv_obj_t *make_slider_row(lv_obj_t *parent, const char *label_text, int m
 
     lv_obj_t *lbl = lv_label_create(row);
     lv_label_set_text_fmt(lbl, "%s %d", label_text, val);
-    lv_obj_set_width(lbl, 92);
+    lv_obj_set_width(lbl, 120);     /* 容得下 "exp 500 (auto)" 不换行 */
     lv_obj_set_style_text_color(lbl, lv_color_hex(C_DIM), 0);
     if (out_lbl) *out_lbl = lbl;
 
@@ -430,14 +705,33 @@ static void btn_event_cb(lv_event_t *e)
         send_cmd(js);
         s_ui.src_mode = v;
         lv_label_set_text(s_ui.lbl_src, to_pc ? "PC frame" : "Camera");
-        ui_shared_add_log(to_pc ? "src -> pc (PC 送帧)" : "src -> cam (板载摄像头)");
+        ui_shared_add_log(to_pc ? "src -> pc (PC frames)" : "src -> cam (onboard camera)");
     } else if (!strncmp(id, "fps", 3)) {
-        /* 帧率档位：板端降 VTS 换更长曝光，并自动把 exp/gain 拉到新上限 */
+        /* 帧率档位：板端降 VTS 换更长曝光，并自动把 exp/gain 拉到新上限；
+           手动改帧率时板端会自动退出自动模式，这里同步按钮状态 */
         int f = atoi(id + 3);
-        char js[96];
-        snprintf(js, sizeof(js), "{\"cmd\":\"cam\",\"fps\":%d,\"auto_exp\":true}", f);
+        char js[112];
+        snprintf(js, sizeof(js), "{\"cmd\":\"cam\",\"fps\":%d,\"auto_exp\":true,\"auto_fps\":false}", f);
         send_cmd(js);
-        ui_shared_add_log("fps -> night shift (exp/gain auto max)");
+        if (s_ui.auto_on) {
+            s_ui.auto_on = false;
+            if (s_ui.lbl_auto) {
+                lv_label_set_text(s_ui.lbl_auto, "AUTO OFF");
+            }
+        }
+        ui_shared_add_log("fps -> night shift (exp/gain auto max, auto off)");
+    } else if (!strcmp(id, "auto")) {
+        /* 自动帧率开关（夜视档专用）：运动自动切 50fps，静止回落夜视阶梯档；
+           白天（tier0）恒定 50fps，此开关在白天没有效果（低光照逻辑不上身） */
+        s_ui.auto_on = !s_ui.auto_on;
+        char js[96];
+        snprintf(js, sizeof(js), "{\"cmd\":\"cam\",\"auto_fps\":%s}", s_ui.auto_on ? "true" : "false");
+        send_cmd(js);
+        if (s_ui.lbl_auto) {
+            lv_label_set_text(s_ui.lbl_auto, s_ui.auto_on ? "AUTO ON" : "AUTO OFF");
+        }
+        ui_shared_add_log(s_ui.auto_on ? "auto-fps ON (night: motion 50fps <-> ladder idle; day: fixed 50)"
+                                       : "auto-fps OFF");
     } else if (!strcmp(id, "dn")) {
         /* 时域降噪循环档：Off -> Low -> Mid -> High -> Off
            （板端对静止区域做多帧加权平均，运动区域自动跳过；高帧率下会被守卫跳过）*/
@@ -470,6 +764,34 @@ static void btn_event_cb(lv_event_t *e)
     } else if (!strcmp(id, "day")) {
         send_cmd("{\"cmd\":\"cam\",\"gain\":72,\"exp\":519}");
         ui_shared_add_log("day mode: gain 72 / exp 519");
+    } else if (!strcmp(id, "autoall")) {
+        /* 一键回全自动（光照双模式的默认工作方式）：夜视阶梯 + 运动自适应 + AE/AWB 全开。
+           按钮高亮由结果帧的 night/auto/ae/awb 驱动（见 ui_shared_set_result），
+           这里不手动置色，避免与板端实际状态不一致。 */
+        send_cmd("{\"cmd\":\"cam\",\"night\":true,\"auto_fps\":true,\"ae\":true,\"awb\":true}");
+        ui_shared_add_log("auto all: night ladder + auto-fps + AE/AWB on");
+    } else if (!strcmp(id, "ae")) {
+        /* 自动曝光开关（板端 app 级闭环：帧亮度 -> exp/gain；手动拖滑块会自动退出） */
+        s_ui.ae_on = !s_ui.ae_on;
+        char js[72];
+        snprintf(js, sizeof(js), "{\"cmd\":\"cam\",\"ae\":%s}", s_ui.ae_on ? "true" : "false");
+        send_cmd(js);
+        if (s_ui.lbl_ae) {
+            lv_label_set_text(s_ui.lbl_ae, s_ui.ae_on ? "AE ON" : "AE OFF");
+        }
+        ui_shared_add_log(s_ui.ae_on ? "auto exposure ON (target luma loop)"
+                                     : "auto exposure OFF");
+    } else if (!strcmp(id, "awb")) {
+        /* 自动白平衡开关（板端灰世界 -> 软件白平衡 kr/kb；手动 WB 会自动退出） */
+        s_ui.awb_on = !s_ui.awb_on;
+        char js[76];
+        snprintf(js, sizeof(js), "{\"cmd\":\"cam\",\"awb\":%s}", s_ui.awb_on ? "true" : "false");
+        send_cmd(js);
+        if (s_ui.lbl_awb) {
+            lv_label_set_text(s_ui.lbl_awb, s_ui.awb_on ? "AWB ON" : "AWB OFF");
+        }
+        ui_shared_add_log(s_ui.awb_on ? "auto white balance ON (gray world)"
+                                      : "auto white balance OFF");
     } else if (!strcmp(id, "wb")) {
         /* 软件白平衡开关（预设值与板端 Kconfig 默认一致：1320/1645） */
         s_ui.wb_on = !s_ui.wb_on;
@@ -503,7 +825,7 @@ static lv_obj_t *make_btn(lv_obj_t *parent, const char *text, const char *id, lv
 {
     lv_obj_t *b = lv_button_create(parent);
     lv_obj_set_flex_grow(b, 1);
-    lv_obj_set_height(b, 46);
+    lv_obj_set_height(b, 38);
     lv_obj_set_style_bg_color(b, lv_color_hex(C_PANEL), 0);
     lv_obj_set_style_radius(b, 6, 0);
     lv_obj_t *l = lv_label_create(b);
@@ -532,10 +854,10 @@ void ui_shared_init(void)
     lv_obj_set_flex_flow(root, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(root, 4, 0);
 
-    /* --- 状态栏 --- */
+    /* --- 状态栏：链路 | 模式徽标 | 图像源 --- */
     lv_obj_t *bar = lv_obj_create(root);
     lv_obj_set_width(bar, lv_pct(100));
-    lv_obj_set_height(bar, 34);
+    lv_obj_set_height(bar, 30);
     lv_obj_set_style_bg_color(bar, lv_color_hex(C_PANEL), 0);
     lv_obj_set_style_radius(bar, 6, 0);
     lv_obj_set_style_border_width(bar, 0, 0);
@@ -546,13 +868,17 @@ void ui_shared_init(void)
     s_ui.lbl_link = lv_label_create(bar);
     lv_label_set_text(s_ui.lbl_link, "offline");
     lv_obj_set_style_text_color(s_ui.lbl_link, lv_color_hex(C_WARN), 0);
+    s_ui.lbl_mode = lv_label_create(bar);
+    lv_label_set_text(s_ui.lbl_mode, "");
+    lv_obj_set_style_text_color(s_ui.lbl_mode, lv_color_hex(C_ACCENT), 0);
     s_ui.lbl_stream = lv_label_create(bar);
     lv_label_set_text(s_ui.lbl_stream, "-");
     lv_obj_set_style_text_color(s_ui.lbl_stream, lv_color_hex(C_DIM), 0);
 
-    /* --- 图像区 --- */
+    /* --- 预览区：弹性占满剩余高度，图像等比 letterbox 居中 --- */
     s_ui.img_holder = lv_obj_create(root);
-    lv_obj_set_size(s_ui.img_holder, IMG_W, IMG_H);
+    lv_obj_set_width(s_ui.img_holder, lv_pct(100));
+    lv_obj_set_flex_grow(s_ui.img_holder, 1);
     lv_obj_set_style_bg_color(s_ui.img_holder, lv_color_hex(0x000000), 0);
     lv_obj_set_style_border_width(s_ui.img_holder, 0, 0);
     lv_obj_set_style_radius(s_ui.img_holder, 4, 0);
@@ -563,7 +889,7 @@ void ui_shared_init(void)
     lv_obj_center(s_ui.img);
 
     s_ui.no_signal = lv_label_create(s_ui.img_holder);
-    lv_label_set_text(s_ui.no_signal, "waiting for image...\n(按 Preview ON + Camera)");
+    lv_label_set_text(s_ui.no_signal, "waiting for image...\n(press Preview ON + Camera)");
     lv_obj_set_style_text_align(s_ui.no_signal, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_color(s_ui.no_signal, lv_color_hex(C_DIM), 0);
     lv_obj_center(s_ui.no_signal);
@@ -594,66 +920,78 @@ void ui_shared_init(void)
     lv_label_set_text(s_ui.lbl_event, "");
     lv_obj_set_style_text_color(s_ui.lbl_event, lv_color_hex(C_ACCENT), 0);
 
-    /* --- 摄像头参数：增益 / 曝光 滑块 --- */
-    s_ui.sl_gain = make_slider_row(root, "gain", 0, s_ui.gain_max, s_ui.gain, &s_ui.lbl_gain);
-    s_ui.sl_exp = make_slider_row(root, "exp", 8, s_ui.exp_max, s_ui.exp_val, &s_ui.lbl_exp);
-
-    /* --- 名单 --- */
-    s_ui.lbl_list = lv_label_create(root);
-    lv_obj_set_width(s_ui.lbl_list, lv_pct(100));
-    lv_obj_set_flex_grow(s_ui.lbl_list, 1);
-    lv_label_set_long_mode(s_ui.lbl_list, LV_LABEL_LONG_WRAP);
-    lv_label_set_text(s_ui.lbl_list, "lib: -");
-    lv_obj_set_style_text_color(s_ui.lbl_list, lv_color_hex(C_DIM), 0);
-
-    /* --- 按钮 --- */
-    for (int row = 0; row < 4; row++) {
+    /* --- 按钮：按功能分组（识别 x2 / 模式 / 帧率 / 画质） --- */
+    for (int row = 0; row < 5; row++) {
         lv_obj_t *r = lv_obj_create(root);
         lv_obj_set_width(r, lv_pct(100));
-        lv_obj_set_height(r, 46);
+        lv_obj_set_height(r, 38);
         lv_obj_set_style_bg_opa(r, LV_OPA_TRANSP, 0);
         lv_obj_set_style_border_width(r, 0, 0);
         lv_obj_set_style_pad_all(r, 0, 0);
         lv_obj_set_style_pad_column(r, 4, 0);
         lv_obj_set_flex_flow(r, LV_FLEX_FLOW_ROW);
         lv_obj_remove_flag(r, LV_OBJ_FLAG_SCROLLABLE);
-        if (row == 0) {
+        switch (row) {
+        case 0:                                    /* 识别操作 */
             make_btn(r, "Start", "start", NULL);
             make_btn(r, "Stop", "stop", NULL);
             make_btn(r, "Register", "register", NULL);
             make_btn(r, "Delete", "delete", NULL);
-        } else if (row == 1) {
+            break;
+        case 1:
             make_btn(r, "List", "list", NULL);
             make_btn(r, "Clear", "clear", NULL);
             make_btn(r, "Camera", "src", &s_ui.lbl_src);
             make_btn(r, "Preview ON", "stream", &s_ui.lbl_stream_btn);
-        } else if (row == 2) {
+            break;
+        case 2:                                    /* 模式：一键全自动 + 手动预设 */
+            /* Auto All = 夜视阶梯 + 运动自适应 + AE/AWB 全开（光照双模式的默认工作方式） */
+            s_ui.btn_autoall = make_btn(r, "Auto All", "autoall", NULL);
             /* Night Hi = 10fps + exp max + gain max（最亮）；Night Lo = 同上但增益 ~62%（低噪）*/
             make_btn(r, "Night Hi", "night", NULL);
             make_btn(r, "Night Lo", "night_lo", NULL);
             make_btn(r, "Day", "day", NULL);
-            make_btn(r, "Mirror ON", "mirror", &s_ui.lbl_mirror);
-            make_btn(r, "WB ON", "wb", &s_ui.lbl_wb);
-        } else {
-            /* 帧率档位：帧率越低 -> 曝光上限越高（夜视长曝光）。
-               板端收到后会顺手把曝光/增益拉到新上限（auto_exp）。 */
+            break;
+        case 3:                                    /* 帧率：帧率越低 -> 曝光上限越高（夜视长曝光） */
             make_btn(r, "50fps", "fps50", NULL);
             make_btn(r, "25fps", "fps25", NULL);
             make_btn(r, "15fps", "fps15", NULL);
-            make_btn(r, "10fps", "fps10", NULL);
-            /* 时域降噪循环档：点击在 Off → Low → Mid → High 之间循环 */
+            /* 自动帧率开关（运动自适应）：静止由夜视阶梯决定，检测到运动自动切 50fps */
+            make_btn(r, "AUTO OFF", "auto", &s_ui.lbl_auto);
+            break;
+        default:                                   /* 画质：镜像/白平衡/自动曝光/自动白平衡/降噪 */
+            make_btn(r, "Mirror ON", "mirror", &s_ui.lbl_mirror);
+            make_btn(r, "WB ON", "wb", &s_ui.lbl_wb);
+            make_btn(r, "AE OFF", "ae", &s_ui.lbl_ae);
+            make_btn(r, "AWB OFF", "awb", &s_ui.lbl_awb);
+            /* 时域降噪循环档：点击在 Off -> Low -> Mid -> High 之间循环 */
             make_btn(r, "DN Off", "dn", &s_ui.lbl_dn);
+            break;
         }
     }
+
+    /* --- 摄像头参数：增益 / 曝光 滑块（AE 开时置灰提示"自动中"） --- */
+    s_ui.sl_gain = make_slider_row(root, "gain", 0, s_ui.gain_max, s_ui.gain, &s_ui.lbl_gain);
+    s_ui.sl_exp = make_slider_row(root, "exp", 8, s_ui.exp_max, s_ui.exp_val, &s_ui.lbl_exp);
+
+    /* --- 名单 --- */
+    s_ui.lbl_list = lv_label_create(root);
+    lv_obj_set_width(s_ui.lbl_list, lv_pct(100));
+    lv_obj_set_height(s_ui.lbl_list, 14);
+    lv_label_set_long_mode(s_ui.lbl_list, LV_LABEL_LONG_DOT);
+    lv_label_set_text(s_ui.lbl_list, "lib: -");
+    lv_obj_set_style_text_color(s_ui.lbl_list, lv_color_hex(C_DIM), 0);
 
     /* --- 日志 --- */
     s_ui.lbl_log = lv_label_create(root);
     lv_obj_set_width(s_ui.lbl_log, lv_pct(100));
-    lv_obj_set_height(s_ui.lbl_log, 62);
+    lv_obj_set_height(s_ui.lbl_log, 56);
     lv_label_set_long_mode(s_ui.lbl_log, LV_LABEL_LONG_WRAP);
     lv_label_set_text(s_ui.lbl_log, "");
     lv_obj_set_style_text_color(s_ui.lbl_log, lv_color_hex(C_DIM), 0);
     lv_obj_set_style_text_font(s_ui.lbl_log, &lv_font_montserrat_14, 0);
+
+    sliders_auto_hint(s_ui.ae_on);      /* AE 默认开：滑块初始即置灰提示 */
 }
 
 void ui_shared_set_action_cb(ui_shared_action_cb_t cb, void *arg)
@@ -678,6 +1016,9 @@ void ui_shared_set_link(bool connected, const char *detail)
         send_cmd("{\"cmd\":\"src\",\"value\":\"cam\"}");
         /* 明确要 JPEG：raw(614KB/帧) 是排查用的，UI 用不上且很吃带宽 */
         send_cmd("{\"cmd\":\"stream\",\"value\":\"on\",\"fps\":10,\"fmt\":\"jpeg\"}");
+        /* 立刻同步一次板端状态：ack 会带 gain/exp/mirror/wb/ae/awb/auto/dn/night/ntier，
+           滑块位置、开关按钮、模式徽标不用等用户手动发命令就对齐 */
+        send_cmd("{\"cmd\":\"cam\"}");
         lv_label_set_text(s_ui.lbl_src, "Camera");
         lv_label_set_text(s_ui.lbl_stream_btn, "Preview ON");
         s_ui.stream_on = true;
@@ -721,10 +1062,22 @@ void ui_shared_set_image(const uint8_t *data, uint32_t len, int fmt, int width, 
     s_ui.dsc.data_size = (uint32_t)((size_t)s_ui.rgb_stride * s_ui.rgb_h);
     s_ui.dsc.data = s_ui.rgb;
 
-    /* 按宽度适配显示区（640x480 -> 480x360 恰好 0.75x） */
-    int32_t scale = (int32_t)((IMG_W * 256) / (s_ui.rgb_w ? s_ui.rgb_w : IMG_W));
+    /* 等比缩放到预览区内接（letterbox 居中）：缩放系数同时记录下来给检测框定位，
+       修掉旧版"按宽缩放 + 框 Y 按容器高压缩"造成的框/画面错位 */
+    int32_t hold_w = lv_obj_get_width(s_ui.img_holder);
+    int32_t hold_h = lv_obj_get_height(s_ui.img_holder);
+    if (hold_w < 8 || hold_h < 8) {          /* 布局还没算好（首帧过早）时的兜底 */
+        hold_w = 468;                        /* 480 - 2*6 边距 */
+        hold_h = 366;
+    }
+    float sc = (float)hold_w / (float)(s_ui.rgb_w ? s_ui.rgb_w : hold_w);
+    float sc_h = (float)hold_h / (float)(s_ui.rgb_h ? s_ui.rgb_h : hold_h);
+    if (sc_h < sc) sc = sc_h;
+    s_ui.disp_scale = sc;
+    s_ui.disp_ox = ((float)hold_w - (float)s_ui.rgb_w * sc) * 0.5f;
+    s_ui.disp_oy = ((float)hold_h - (float)s_ui.rgb_h * sc) * 0.5f;
     lv_image_set_src(s_ui.img, &s_ui.dsc);
-    lv_image_set_scale(s_ui.img, (uint32_t)scale);
+    lv_image_set_scale(s_ui.img, (uint32_t)(sc * 256.0f));
     lv_obj_center(s_ui.img);
     lv_obj_invalidate(s_ui.img);
     lv_obj_add_flag(s_ui.no_signal, LV_OBJ_FLAG_HIDDEN);
@@ -748,21 +1101,65 @@ void ui_shared_set_result(const char *json)
     json_str(json, "event", event, sizeof(event));
     json_str(json, "msg", msg, sizeof(msg));
 
-    char who[64];
-    if (has_match) {
+    /* F8：boxes 先行解析（结果行要脸宽；每框名字/相似度填进 s_ui 供检测框标签用） */
+    float box[MAX_BOXES][4];
+    char  box_names[MAX_BOXES][UI_NAME_MAX];
+    float box_sims[MAX_BOXES];
+    int nb = json_boxes(json, box, box_names, box_sims, MAX_BOXES);
+    memset(s_ui.box_name, 0, sizeof(s_ui.box_name));
+    for (int i = 0; i < nb; i++) {
+        snprintf(s_ui.box_name[i], UI_NAME_MAX, "%s", box_names[i]);
+        s_ui.box_sim[i] = box_sims[i];
+    }
+    int face_w = (nb > 0) ? (int)(box[0][2] - box[0][0]) : -1;
+
+    /* F8：结果行稳定态（ASCII：LVGL 内置字体无 ✓） */
+    int stable = json_int(json, "stable", -1);
+    char who[80];
+    if (!strcmp(event, "enrolling")) {
+        snprintf(who, sizeof(who), "enrolling");
+    } else if (has_match && stable == 1) {
+        snprintf(who, sizeof(who), "OK %s %.2f", match, (double)sim);
+    } else if (!strcmp(event, "match")) {
+        snprintf(who, sizeof(who), "OK %s %.2f", match, (double)sim);
+    } else if (!strcmp(event, "tracking")) {
+        snprintf(who, sizeof(who), ".. %s", has_match ? match : "confirming");
+    } else if (!strcmp(event, "reject") && stable == 1) {
+        snprintf(who, sizeof(who), "?? stranger");
+    } else if (has_match) {
         snprintf(who, sizeof(who), "%s %.2f", match, (double)sim);
     } else {
         snprintf(who, sizeof(who), "-");
     }
-    /* 板端 sensor 帧率（点了下面的档位按钮就会变，直接显示出来当反馈）*/
+    char cw[16] = "";
+    if (face_w > 0) {
+        snprintf(cw, sizeof(cw), " w%d", face_w);   /* F8：检出反馈（脸宽 px） */
+    }
+    /* 板端 sensor 帧率（自动模式下会实时变，直接显示出来当反馈）*/
     int cfps = json_int(json, "cam_fps", 0);
-    char cf[16] = "";
+    char cf[28] = "";
     if (cfps > 0) {
-        snprintf(cf, sizeof(cf), "  cam%dfps", cfps);
+        snprintf(cf, sizeof(cf), "  cam%dfps%s", cfps, s_ui.auto_on ? " auto" : "");
+    }
+    /* 自动帧率状态：与板端对齐（命令行改的也能同步按钮文字）。
+       板端结果帧字段是 "auto"（旧代码找 "auto_fps" 永远匹配不到，同步失效） */
+    int au = json_int(json, "auto", -1);
+    if (au >= 0 && (au != 0) != s_ui.auto_on) {
+        s_ui.auto_on = au != 0;
+        if (s_ui.lbl_auto) {
+            lv_label_set_text(s_ui.lbl_auto, s_ui.auto_on ? "AUTO ON" : "AUTO OFF");
+        }
+    }
+    /* 实时运动占比：优先运动估计器的 mv，DN 关着没有时回退降噪的 dn_mv；
+       mvNN% 接近 0 说明画面静止，越高说明越"动" */
+    int mv = json_int(json, "mv", json_int(json, "dn_mv", -1));
+    char cmv[16] = "";
+    if (mv >= 0) {
+        snprintf(cmv, sizeof(cmv), " mv%d%%", mv);
     }
     /* 时域降噪档：非 0 才显示；同时把按钮文字与板端对齐（例如从命令行改的）*/
     int dn = json_int(json, "dn", -1);
-    char cdn[16] = "";
+    char cdn[20] = "";
     if (dn > 0) {
         snprintf(cdn, sizeof(cdn), "  dn%d", dn);
     }
@@ -773,12 +1170,67 @@ void ui_shared_set_result(const char *json)
             lv_label_set_text_fmt(s_ui.lbl_dn, "DN %s", dnm[dn]);
         }
     }
+    /* 夜视阶梯档位：tier>=1 = 低光照夜视模式（板端此档不做人脸识别，
+       AI 让出帧池给预览，结果帧 event="night" 2Hz 低频上报） */
+    int nti = json_int(json, "ntier", -1);
+    int non = json_int(json, "night", -1);
+    if (non >= 0 && nti >= 0) {
+        s_ui.night_on = non;
+        s_ui.night_tier = nti;
+    }
+    char cnight[16] = "";
+    if (s_ui.night_on > 0 && s_ui.night_tier >= 1) {
+        snprintf(cnight, sizeof(cnight), " night%d", s_ui.night_tier);
+    }
+    /* 状态栏模式徽标：阶梯开着才显示（关着 = 手动模式，不标） */
+    if (s_ui.lbl_mode) {
+        if (s_ui.night_on > 0 && s_ui.night_tier >= 1) {
+            lv_obj_set_style_text_color(s_ui.lbl_mode, lv_color_hex(C_NIGHT), 0);
+            lv_label_set_text_fmt(s_ui.lbl_mode, "NIGHT %d", s_ui.night_tier);
+        } else if (s_ui.night_on > 0) {
+            lv_obj_set_style_text_color(s_ui.lbl_mode, lv_color_hex(C_ACCENT), 0);
+            lv_label_set_text(s_ui.lbl_mode, "DAY");
+        } else if (s_ui.night_on == 0) {
+            lv_label_set_text(s_ui.lbl_mode, "");
+        }
+    }
+    /* AE/AWB 自动模式状态（板端被手动操作退出时按钮文字跟着变） */
+    int ae = json_int(json, "ae", -1);
+    if (ae >= 0 && (ae != 0) != s_ui.ae_on) {
+        s_ui.ae_on = ae != 0;
+        if (s_ui.lbl_ae) {
+            lv_label_set_text(s_ui.lbl_ae, s_ui.ae_on ? "AE ON" : "AE OFF");
+        }
+        sliders_auto_hint(s_ui.ae_on);      /* AE 开关联动滑块置灰/(auto) 提示 */
+    }
+    int awb = json_int(json, "awb", -1);
+    if (awb >= 0 && (awb != 0) != s_ui.awb_on) {
+        s_ui.awb_on = awb != 0;
+        if (s_ui.lbl_awb) {
+            lv_label_set_text(s_ui.lbl_awb, s_ui.awb_on ? "AWB ON" : "AWB OFF");
+        }
+    }
+    /* Auto All 高亮 = 板端确实处于全自动（夜视阶梯 + 运动自适应 + AE/AWB 全开） */
+    if (s_ui.btn_autoall) {
+        bool all = (s_ui.night_on > 0) && s_ui.auto_on && s_ui.ae_on && s_ui.awb_on;
+        lv_obj_set_style_bg_color(s_ui.btn_autoall, lv_color_hex(all ? C_ACCENT : C_PANEL), 0);
+        lv_obj_t *lbl = lv_obj_get_child(s_ui.btn_autoall, 0);
+        if (lbl) {
+            lv_obj_set_style_text_color(lbl, lv_color_hex(all ? C_BG : C_TEXT), 0);
+        }
+    }
+    /* AE 开着时显示实时亮度（收敛到 ae_tgt 附近即正常） */
+    int luma = json_int(json, "luma", -1);
+    char cluma[16] = "";
+    if (luma >= 0 && s_ui.ae_on) {
+        snprintf(cluma, sizeof(cluma), " L%d", luma);
+    }
     if (libn >= 0) {
-        lv_label_set_text_fmt(s_ui.lbl_result, "faces %d   %s   %.1f fps  %d ms  lib %d%s%s",
-                              faces, who, (double)fps, infer, libn, cf, cdn);
+        lv_label_set_text_fmt(s_ui.lbl_result, "faces %d   %s   %.1f fps  %d ms  lib %d%s%s%s%s%s%s",
+                              faces, who, (double)fps, infer, libn, cf, cdn, cmv, cw, cluma, cnight);
     } else {
-        lv_label_set_text_fmt(s_ui.lbl_result, "faces %d   %s   %.1f fps  %d ms%s%s",
-                              faces, who, (double)fps, infer, cf, cdn);
+        lv_label_set_text_fmt(s_ui.lbl_result, "faces %d   %s   %.1f fps  %d ms%s%s%s%s%s%s",
+                              faces, who, (double)fps, infer, cf, cdn, cmv, cw, cluma, cnight);
     }
 
     lv_label_set_text_fmt(s_ui.lbl_stream, "src %s", src[0] ? src : "-");
@@ -788,6 +1240,23 @@ void ui_shared_set_result(const char *json)
     }
 
     /* 事件优先级：registered / match / deleted / error 等直接显示 */
+    /* F8：注册采集进度（弹窗进度态）；registered/error 自动关闭弹窗 */
+    if (s_ui.enrolling) {
+        int cN = 0, cM = 0;
+        if (!strcmp(event, "enrolling") && sscanf(msg, "collected %d/%d", &cN, &cM) == 2) {
+            if (s_ui.lbl_prog) {
+                lv_label_set_text_fmt(s_ui.lbl_prog, "collected %d/%d - stay in view", cN, cM);
+            }
+            if (s_ui.bar_prog) {
+                lv_bar_set_value(s_ui.bar_prog, cN, LV_ANIM_OFF);
+            }
+        }
+        if (!strcmp(event, "registered") || !strcmp(event, "error")) {
+            s_ui.enrolling = false;
+            close_input();
+        }
+    }
+
     if (msg[0]) {
         snprintf(s_ui.ev_text, sizeof(s_ui.ev_text), "%s: %s", event, msg);
     } else {
@@ -797,12 +1266,10 @@ void ui_shared_set_result(const char *json)
     lv_obj_set_style_text_color(s_ui.lbl_event,
                                 lv_color_hex(!strcmp(event, "error") ? C_WARN : C_ACCENT), 0);
 
-    /* 检测框 */
-    float box[MAX_BOXES][4];
-    int n = json_boxes(json, box, MAX_BOXES);
+    /* 检测框（box/nb/每框名字已在上方解析；update_boxes 内部优先用每框名字） */
     bool show_name = has_match && (!strcmp(event, "match") || !strcmp(event, "registered") ||
                                    !strcmp(event, "none"));
-    update_boxes((const float(*)[4])box, n, show_name ? match : NULL);
+    update_boxes((const float(*)[4])box, nb, show_name ? match : NULL);
 
     /* 摄像头参数：同步滑块/按钮的真实值（板端每条结果帧都带 gain/exp/mirror） */
     int gmax = json_int(json, "gain_max", -1);
@@ -818,18 +1285,20 @@ void ui_shared_set_result(const char *json)
     int g = json_int(json, "gain", -1);
     if (g >= 0) {
         s_ui.gain = g;
-        if (!s_ui.dragging && s_ui.sl_gain) {
-            lv_slider_set_value(s_ui.sl_gain, g, LV_ANIM_OFF);
-            lv_label_set_text_fmt(s_ui.lbl_gain, "gain %d", g);
-        }
     }
     int ex = json_int(json, "exp", -1);
     if (ex >= 0) {
         s_ui.exp_val = ex;
-        if (!s_ui.dragging && s_ui.sl_exp) {
-            lv_slider_set_value(s_ui.sl_exp, ex, LV_ANIM_OFF);
-            lv_label_set_text_fmt(s_ui.lbl_exp, "exp %d", ex);
+    }
+    if ((g >= 0 || ex >= 0) && !s_ui.dragging) {
+        /* 拖动中不用结果帧回写；否则滑块位置与标签（含 AE 的 "(auto)" 后缀）同步 */
+        if (g >= 0 && s_ui.sl_gain) {
+            lv_slider_set_value(s_ui.sl_gain, g, LV_ANIM_OFF);
         }
+        if (ex >= 0 && s_ui.sl_exp) {
+            lv_slider_set_value(s_ui.sl_exp, ex, LV_ANIM_OFF);
+        }
+        slider_label_refresh();
     }
     int wkr = json_int(json, "wb_kr", -1);
     if (wkr >= 0) {

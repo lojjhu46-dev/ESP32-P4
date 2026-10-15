@@ -1,0 +1,6 @@
+# 根级忽略（2026-10-15）
+#
+# 1) `nul`：Windows 把 `> nul` 当文件名造出来的幽灵设备名文件。
+#    git 无法索引它（error: short read while indexing nul），且常规手段删不掉，
+#    会直接卡死 `git add .`。本地忽略即可，不影响任何流程。
+/nul

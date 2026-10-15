@@ -12,6 +12,7 @@
 #include "app_i2c.h"
 #include "app_display.h"
 #include "app_wifi.h"
+#include "app_ble.h"
 #include "app_sdcard.h"
 #include "app_eth.h"
 #include "app_audio.h"
@@ -105,6 +106,13 @@ void app_main(void)
 #else
     app_status_set(APP_MOD_WIFI, true, "disabled");
     ESP_LOGW(TAG, "wifi disabled (esp-hosted host/CP fw mismatch: see HANDOVER)");
+#endif
+
+    /* BLE 与 WiFi 共用 C6/esp-hosted 链路（HCI over SDIO），必须在 wifi 之后 */
+#if CONFIG_APP_ENABLE_BLE
+    app_ble_init();
+#else
+    app_status_set(APP_MOD_BLE, true, "disabled");
 #endif
 
 #if CONFIG_APP_ENABLE_AUDIO

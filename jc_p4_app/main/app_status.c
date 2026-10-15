@@ -10,7 +10,7 @@ static SemaphoreHandle_t s_lock;
 static const char *const s_names[APP_MOD_MAX] = {
     "I2C bus", "LCD", "Touch", "Wi-Fi", "TF card",
     "Ethernet", "RS485", "Audio", "Battery", "Camera", "USB link",
-    "Image pipe", "Face AI", "Img stream",
+    "Image pipe", "Face AI", "Img stream", "BLE",
 };
 
 static void ensure_lock(void)

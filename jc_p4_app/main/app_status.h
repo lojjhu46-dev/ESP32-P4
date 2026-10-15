@@ -22,6 +22,7 @@ typedef enum {
     APP_MOD_PIPE,
     APP_MOD_FACE,
     APP_MOD_STREAM,
+    APP_MOD_BLE,
     APP_MOD_MAX
 } app_module_t;
 
