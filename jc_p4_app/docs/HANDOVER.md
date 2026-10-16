@@ -243,6 +243,25 @@ esp_tinyusb 自己的注释也写明"USB DMA buffers live in internal SRAM"且�
   - 脚本/CI：`qt_host.exe --selftest --serial COM5 --grab-raw out.png`
     → `grab-raw: ok=1 640x480 data=614400B`（实测 0.5s/帧，PNG 与 JPEG 通路画面一致 ⇒ 字节序无需交换）。
 
+### 3.4 USB vs TCP 同档 A/B（2026-10-16，同场同工具）
+| 档位 | **USB**（COM5） | **TCP**（192.168.33.2） | 差异 |
+|---|---|---|---|
+| JPEG @10fps | 229 KB/s | 217 KB/s | ≈ 同档 |
+| JPEG @20fps | 306 KB/s | **327 KB/s** | TCP 略高 ≤10% |
+| JPEG @30fps | 286 KB/s | **335 KB/s** | TCP 略高 ≤15% |
+| **raw @10fps** | **1389 KB/s** | 1297 KB/s | **USB 高 ~7%**（±0.2%） |
+
+⇒ **两条链路吞吐同档（±10%），功能完全对等**。双接口 jc_test 套件（`pc_host/_ab_test.ps1`，ASCII-only）
+两遍全绿：`list` / `link 查询` / `stream on-off` / **0x01 PC 送图** / **0x06 F10 导出+导入（覆盖式恢复）**
+/ 恢复后名单一致 `["musk","personA"] lib_feats=[1,3]`。USB 侧另跑过识别回归 25/25。
+
+**强制切换的实测行为（切之前要知道）**
+- 在 **TCP 客户端上**发 `{"cmd":"link","value":"usb"}`：状态**立即生效**，但该命令的 ack 已改走 USB
+  ⇒ TCP 客户端**收不到应答并被断开**（板端日志 `link forced to usb -> dropping client ...`）。
+  从 TCP 切 USB 时，请**用 USB 侧再查一次 `{"cmd":"link"}`** 确认（实测确认 `link=usb active=usb-cdc`）。
+- 强制 usb 期间新 TCP 连接被拒绝 + 0x04 说明；断开 TCP 客户端后 `auto` 自动回落 `usb-cdc`（实测）。
+- `link` 查询回 `tx_frames/tx_kb/tx_drop/last_ms`（累计发送统计，排查吞吐/丢帧的首选入口）。
+
 ### 4. ⚠️ CDC FIFO 为什么不能放大（别再试，会开不了机）
 - `CONFIG_TINYUSB_CDC_TX_BUFSIZE` **512→4096 (+3.5KB)**、**8192 (+7.7KB)** 均**开机即崩**：
   `assert failed: vApplicationGetIdleTaskMemory port_common.c:53 (pxStackBufferTemp != NULL)`
