@@ -123,6 +123,24 @@ magic "JCDF"(4) | ver u32=1 | face_len u32 | names_len u32 | names(JSON) | face.
 搬到 PSRAM 也不可行：P4 的 USB DMA 仅覆盖内部 DRAM（`SOC_DMA_LOW/HIGH=0x4ff00000..0x4ffc0000`），
 且 esp_tinyusb 明确要求 USB DMA 缓冲 `DRAM_ATTR` + cache 行对齐。
 
+### USB vs TCP 同档 A/B（2026-10-16，同场同工具，`_usb_bench.py`，每档 3 次取中位）
+| 档位 | **USB**（COM5） | **TCP**（192.168.33.2:3333） | 差异 |
+|---|---|---|---|
+| 0x05 JPEG @10fps | **229 KB/s**（227~235） | **217 KB/s**（208~225） | ≈ 同档 |
+| 0x05 JPEG @20fps | 306 KB/s（300~310） | **327 KB/s**（294~345） | TCP 略高（≤10%） |
+| 0x05 JPEG @30fps | 286 KB/s（284~294） | **335 KB/s**（289~343） | TCP 略高（≤15%） |
+| **0x05 raw @10fps** | **1389 KB/s**（1294~1394） | 1297 KB/s（1295~1299） | **USB 高 ~7%**（±0.2% 极稳） |
+
+⇒ **两条链路吞吐同档（±10%）**：JPEG ≈9~13fps 等效、raw ≈2.2fps 等效，**功能完全对等**
+（USB 侧已实测 0x01/0x02/0x03/0x04/0x05/0x06 全通 + 识别回归 25/25 + F10 备份恢复；TCP 侧同样全套）。
+
+### 强制切换的实测行为（重要）
+- 在 **TCP 客户端上**发 `{"cmd":"link","value":"usb"}`：状态**立即生效**，但那条命令的 ack 已经
+  改走 USB 了 —— TCP 客户端会**收不到应答并被断开**（日志 `link forced to usb -> dropping client`）。
+  ⇒ 从 TCP 侧切到 USB 时，请以 **USB 侧再查一次 `{"cmd":"link"}`** 为准（或直接重连）。
+- 反向（强制 usb 时新 TCP 连接）会被拒绝并在 0x04 里说明原因（`netlink: client ... rejected`）。
+- 断开 TCP 客户端后 `link=auto` 会自动回落到 `usb-cdc`（实测：TCP 块跑完，收尾 USB `list` 显示 `link: usb-cdc`）。
+
 ⚠️ **测量三坑**：① CDC 背压——测吞吐时主机**必须持续读**，否则测到的是丢弃率；
 ② 别用 PC 侧计数（突发交付，抖动 ±29%，还会出现 45fps 假读数）；
 ③ 别在流中发查询（0x02 洪泛会让 ack 匹配到错帧）。

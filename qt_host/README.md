@@ -86,6 +86,12 @@ qt_host\build\qt_host.exe --selftest --serial COM5 --seconds 7 --images 3 --fps 
 **CDC FIFO 扫描结论：放大无益**（512 最优；1024/2048 更慢；4096/8192 开不了机——内部 RAM 余量 <3.5KB）。
 把 FIFO 搬到 PSRAM 也不可行（P4 的 USB DMA 只能访问内部 DRAM：`SOC_DMA_LOW/HIGH=0x4ff00000..0x4ffc0000`）。
 
+**USB vs TCP A/B（同场同工具）**：JPEG@10 = 229/217 KB/s、JPEG@20 = 306/327、JPEG@30 = 286/335、
+raw@10 = **1389/1297 KB/s** ⇒ **两条链路吞吐同档（±10%）**。
+
+⚠️ **强制切换的坑**：在 **TCP 客户端上**发 `link=usb` 会立即生效、但 ack 已改走 USB ⇒ TCP 侧收不到应答
+并被断开（本上位机的「链路」下拉同理：切完请在目标接口重连/再看徽标）。反向（强制 usb 时连 TCP）会被拒。
+
 ⇒ **路线 = JPEG 预览（8~11fps）+ raw 按需单帧抓取**：
 - UI「流」页有 **`抓一帧 raw → PNG`** 按钮（自动 开流[raw,fps=5] → 取第一帧 → 停流 → 存 `shots/raw_*.png`，约 0.5s）
 - 脚本：`qt_host.exe --selftest --serial COM5 --grab-raw out.png` → `grab-raw: ok=1 640x480 data=614400B`
