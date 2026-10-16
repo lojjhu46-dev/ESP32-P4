@@ -199,18 +199,49 @@ Qt 上位机 `qt_host/`（TCP+USB 双通路、视频+检测框、全功能面板
    改成 **μs 级忙等**（`esp_rom_delay_us(50)` × 最多 64 次，之后才让出 1 tick）：
    JPEG 79KB/s → **283KB/s**，raw 从"大帧被截断丢弃" → **完整 1.36MB/s**。
 
-### 3. 实测数据（COM5 = VID_303A:4001；`qt_host.exe --selftest --serial COM5`）
-| 档位 | 请求 | 实测 | 带宽 | 解码失败 |
-|---|---|---|---|---|
-| 0x05 JPEG | 10fps | 8.3fps | 216 KB/s | 0 |
-| 0x05 JPEG | 20fps | 10.9fps | 281 KB/s | 0 |
-| 0x05 JPEG | 30fps | 11.0fps | 283 KB/s | 0 |
-| 0x05 raw RGB565 | 10fps | **2.07fps** | **1331 KB/s** | 0（帧完整） |
-| 0x06 备份导出 8312B | — | 0.61s | — | 0 |
-| 回归 `_face_r1_test.py --serial COM5` | — | **25/25 PASS** | — | — |
+### 3. 实测数据（COM5 = VID_303A:4001；口径 = 板端 tx 计数 − 空闲基线）
+用新工具 **`pc_host/_usb_bench.py`**（`--serial COM5`）测量，**带宽是可靠量**（重复性好），
+帧率一律由"带宽 ÷ 平均帧长"推算（见 §3.2 的坑）：
 
-**瓶颈定量**：CDC 软件 FIFO 只有 512B ⇒ raw 一帧拆 1200 个包 × 每包 ≈376µs 软件往返
-= 1.36MB/s 天花板。**不是 FS 限制**（板端日志 `USB negotiated speed = HIGH`），也不是主机侧。
+| 档位 | 实测带宽（中位） | 平均帧长 | 推算帧率 | 解码失败 |
+|---|---|---|---|---|
+| 0x05 JPEG @10fps | **217 KB/s** | ~26 KB | ~8.3 fps | 0 |
+| 0x05 JPEG @20fps | **292 KB/s** | ~26 KB | ~11.2 fps | 0 |
+| 0x05 JPEG @30fps | **281 KB/s** | ~26 KB | ~10.8 fps | 0 |
+| 0x05 raw RGB565 @10fps | **1390 KB/s**（±0.5%） | 600 KB | **~2.3 fps** | 0（帧完整） |
+| 0x06 备份导出 8312B | 0.61s | — | — | 0 |
+| 回归 `_face_r1_test.py --serial COM5` | **25/25 PASS** | — | — | — |
+
+板端协商速率 **HIGH (480Mbps)**（`USB negotiated speed = HIGH`）——所以 1.4MB/s 不是 USB 总线限制。
+
+#### 3.1 CDC FIFO 尺寸扫描（③ 路线的结论：**放大无益**）
+| TX FIFO | JPEG@20fps | raw@10fps | 能否启动 |
+|---|---|---|---|
+| **512（选定）** | **292 KB/s** | **1390 KB/s** | ✅ |
+| 1024 (+0.5KB) | 211 KB/s | 1113 KB/s | ✅ |
+| 2048 (+1.5KB) | 245 KB/s | 840 KB/s | ✅ |
+| 4096 (+3.5KB) | — | — | ❌ `assert failed: vApplicationGetIdleTaskMemory`（内部 RAM 耗尽） |
+| 8192 (+7.7KB) | — | — | ❌ `assert failed: esp_startup_start_app (res == pdTRUE)` |
+
+⇒ **FIFO 越大反而越慢**（512 最优），4096 起直接开不了机（本板内部 RAM 余量 < 3.5KB）。
+**把 CDC FIFO 搬到 PSRAM 也不可行**：`SOC_DMA_LOW/HIGH = 0x4ff00000..0x4ffc0000` 只覆盖内部 DRAM，
+esp_tinyusb 自己的注释也写明"USB DMA buffers live in internal SRAM"且强制 `DRAM_ATTR` + cache 行对齐。
+
+#### 3.2 ⭐ 吞吐测量的三个坑（不做对，读数全是错的）
+1. **CDC 是背压式的**：主机不读 → 驱动缓冲满 → 板端 FIFO 满 → 0x05 帧超 500ms 预算被丢。
+   测量期间**必须持续读**（`_usb_bench.py` 用后台 Reader 线程），否则测到的是"丢弃率"
+   （实测只数到 0x02 小帧 ≈7KB/s）。
+2. **不能用 PC 侧计数**：usbser.sys 突发交付 + 缓冲，按"首末帧时间差"算的 fps/带宽抖动 ±29%
+   （同配置 786~1432 KB/s），还会因集中排放出现 **45fps 假读数**。
+3. **不能在流中发查询**：流开着时 0x02 结果帧洪泛，`cmd_and_wait` 会取到普通结果帧（读数全废）。
+   正确做法：关流 → 静默 → 查 `link` 取 `tx_frames/tx_kb`。
+
+### 3.3 路线决定：④ **JPEG 预览 + raw 按需单帧抓取**
+- raw 连续推流 **~1.4MB/s ≈ 2.3fps**，**6MB/s（raw 10fps）在本硬件配置下不可达**（§3.1/§3.2 已证）；
+- 但 **raw 单帧只要 ~0.5s**，颜色标定/取证完全够用 ⇒ 已做成**一等功能**：
+  - 上位机「流」页 **`抓一帧 raw → PNG`** 按钮（自动 开流[raw,fps=5] → 取第一帧 → 停流 → 存 PNG，默认 6s 超时）；
+  - 脚本/CI：`qt_host.exe --selftest --serial COM5 --grab-raw out.png`
+    → `grab-raw: ok=1 640x480 data=614400B`（实测 0.5s/帧，PNG 与 JPEG 通路画面一致 ⇒ 字节序无需交换）。
 
 ### 4. ⚠️ CDC FIFO 为什么不能放大（别再试，会开不了机）
 - `CONFIG_TINYUSB_CDC_TX_BUFSIZE` **512→4096 (+3.5KB)**、**8192 (+7.7KB)** 均**开机即崩**：

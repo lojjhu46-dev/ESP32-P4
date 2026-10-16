@@ -107,20 +107,29 @@ magic "JCDF"(4) | ver u32=1 | face_len u32 | names_len u32 | names(JSON) | face.
 - PC 端不需要"两条链路同时收"：切换 = 在目标接口重新连接（板子一次只服务一个 TCP 客户端）
 
 ### USB 通道实测（2026-10-16，ESP32-P4 USB0 OTG，协商 **HIGH 480Mbps**）
-| 档位 | 请求 | 实测 | 带宽 | 备注 |
-|---|---|---|---|---|
-| 0x05 JPEG | 10fps | 8.3fps | 216 KB/s | 解码零失败 |
-| 0x05 JPEG | 20fps | 10.9fps | 281 KB/s | 与 30fps 同 |
-| 0x05 JPEG | 30fps | 11.0fps | 283 KB/s | 已到本配置上限 |
-| 0x05 raw RGB565 | 10fps | **2.07fps** | **1331 KB/s** | 帧完整（614400B/帧） |
-| 0x01 PC 送图 / 0x02 / 0x03 / 0x04 / 0x06 | — | ✅ 全通 | — | 0x06 备份 8312B 导出 0.61s |
-| 识别回归（`_face_r1_test.py --serial COM5`） | — | ✅ **25/25** | — | USB 与网口功能对等 |
+口径 = 板端 tx 计数 − 空闲基线（`pc_host/_usb_bench.py`）：
 
-⚠️ **瓶颈与结论**：CDC 的软件 FIFO 只有 512B（`CONFIG_TINYUSB_CDC_TX_BUFSIZE`，再大**开不了机**——
-本板内部 RAM 余量 < 3.5KB，实测 4096/8192 都会 `assert failed: vApplicationGetIdleTaskMemory`），
-所以 raw 一帧要拆成 1200 个 512B 包，每包约 376µs 软件往返 → 天花板 ≈ **1.36MB/s**。
-**raw 614400B@10fps（6MB/s）在当前硬件配置下不可达**；需要 raw 时建议**单帧按需抓取**（约 0.5s/帧，
-`fmt:"raw"` + 抓到即 `off`），日常预览用 JPEG（≈8-11fps）。
+| 档位 | 实测带宽（中位） | 推算帧率 | 备注 |
+|---|---|---|---|
+| 0x05 JPEG | 217 KB/s @10fps | ~8.3 fps | 解码零失败 |
+| 0x05 JPEG | 292 KB/s @20fps | ~11.2 fps | 与 30fps 同档上限 |
+| 0x05 JPEG | 281 KB/s @30fps | ~10.8 fps | — |
+| 0x05 raw RGB565 | **1390 KB/s**（±0.5%） | **~2.3 fps** | 帧完整（614400B/帧） |
+| 0x01 PC 送图 / 0x02 / 0x03 / 0x04 / 0x06 | ✅ 全通 | — | 0x06 备份 8312B 导出 0.61s |
+| 识别回归 `_face_r1_test.py --serial COM5` | ✅ **25/25** | — | USB 与网口功能对等 |
+
+⚠️ **FIFO 扫描（勿再试）**：512（选定）> 1024 > 2048（放大反而更慢）；4096/8192 **开不了机**
+（本板内部 RAM 余量 < 3.5KB：`assert failed: vApplicationGetIdleTaskMemory`）。
+搬到 PSRAM 也不可行：P4 的 USB DMA 仅覆盖内部 DRAM（`SOC_DMA_LOW/HIGH=0x4ff00000..0x4ffc0000`），
+且 esp_tinyusb 明确要求 USB DMA 缓冲 `DRAM_ATTR` + cache 行对齐。
+
+⚠️ **测量三坑**：① CDC 背压——测吞吐时主机**必须持续读**，否则测到的是丢弃率；
+② 别用 PC 侧计数（突发交付，抖动 ±29%，还会出现 45fps 假读数）；
+③ 别在流中发查询（0x02 洪泛会让 ack 匹配到错帧）。
+
+✅ **结论/路线**：JPEG 连续预览可用（≈8-11fps）；**raw 连续推流 ~1.4MB/s（≈2.3fps），
+6MB/s 不可达** → raw 改**按需单帧抓取**（0.5s/帧；UI 按钮 或
+`qt_host.exe --selftest --serial COM5 --grab-raw out.png`）。
 
 ## 结果 (type 0x02)
 ```json

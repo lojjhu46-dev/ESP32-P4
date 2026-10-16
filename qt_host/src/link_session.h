@@ -54,6 +54,14 @@ public:
     void dbImport(const QString &path);
     bool dbBusy() const { return m_db.busy; }
 
+    /* ---- ① 路线：raw 按需单帧抓取（2026-10-16）----
+     * 连续 raw 只有 ~1.4MB/s（≈2.3fps，受 CDC 512B FIFO + 主机节奏限制，见 HANDOVER
+     * 第廿五节），但**单帧 0.5s 就能拿到**，颜色标定/取证足够。本方法自动：
+     *   stream on(fmt=raw, fps=5) → 等第一张 raw 帧 → 存 PNG → stream off。
+     * 异步：结果经 rawGrabDone 信号回（ok=false 表示超时或未连接）。 */
+    void startRawGrab(const QString &pngPath, int timeoutMs = 6000);
+    bool rawGrabBusy() const { return !m_grab.path.isEmpty(); }
+
 signals:
     void connected(const QString &desc);
     void disconnected();
@@ -65,6 +73,7 @@ signals:
     void decodeError(const QString &msg);
     void dbProgress(int percent, const QString &text);
     void dbDone(bool ok, const QString &msg);
+    void rawGrabDone(bool ok, const QString &path, int bytes, int width, int height);
 
 private:
     void attach(ITransport *tp);
@@ -104,4 +113,10 @@ private:
         QTimer    *pump = nullptr;
     };
     DbJob m_db;
+
+    struct GrabJob {
+        QString path;              /* 非空 = 抓取进行中（兼作忙标志） */
+        QTimer *timer = nullptr;
+    };
+    GrabJob m_grab;
 };
