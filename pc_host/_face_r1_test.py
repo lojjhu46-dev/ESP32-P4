@@ -93,9 +93,12 @@ def main():
     ap.add_argument("--tcp", default=TCP,
                     help="板子或取景中枢地址；中枢在跑时必须连 127.0.0.1:13333"
                          "（板子一次只服务一个客户端）")
+    ap.add_argument("--serial", default=None,
+                    help="走 USB CDC 串口（如 COM5，板子 High speed USB 口）；"
+                         "与 --tcp 互斥，指定后忽略 --tcp（2026-10-16 加：网口不可用时仍能跑回归）")
     args = ap.parse_args()
     make_noface_jpg()
-    link = Link(tcp=args.tcp)
+    link = Link(tcp=(None if args.serial else args.tcp), serial_port=args.serial)
     try:
         link.cmd_and_wait({"cmd": "src", "value": "pc"})
 

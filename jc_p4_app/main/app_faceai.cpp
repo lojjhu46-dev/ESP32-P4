@@ -836,6 +836,8 @@ static void send_result(const char *event,
     cJSON_AddNumberToObject(root, "dropped", (int)s_drops);
     cJSON_AddStringToObject(root, "event", event);
     cJSON_AddStringToObject(root, "src", app_imgpipe_src_str(app_imgpipe_get_src()));
+    /* 2026-10-16：当前生效的发送链路（"usb-cdc" / "tcp"），上位机用它显示链路徽标 */
+    cJSON_AddStringToObject(root, "link", app_usb_link_active_name());
     if (s_ack_cmd) {
         /* 命令回复专用标记：摄像头常驻推流时，host 靠它把 ack 和流式结果区分开 */
         cJSON_AddStringToObject(root, "ack", s_ack_cmd);
@@ -2592,6 +2594,32 @@ static void handle_cmd(const char *json)
         char msg[48];
         snprintf(msg, sizeof(msg), "src=%s", app_imgpipe_src_str(app_imgpipe_get_src()));
         send_result("none", nullptr, 0, nullptr, 0, msg);
+    } else if (strcmp(cmd, "link") == 0) {
+        /* {"cmd":"link"} 查询 / {"cmd":"link","value":"usb"|"tcp"|"auto"} 强制切换链路
+           —— 2026-10-16「自由切换」：auto = 历史语义（TCP 客户端连上抢占、断开回落 CDC）；
+           usb / tcp = 强制指定发送后端（强制 usb 时新 TCP 客户端会被拒绝并说明）。 */
+        const cJSON *jv = cJSON_GetObjectItem(root, "value");
+        app_usb_link_stats_t st;
+        app_usb_link_get_stats(&st);
+        char msg[160];
+        if (cJSON_IsString(jv)) {
+            if (!app_usb_link_force_backend(jv->valuestring)) {
+                send_result("error", nullptr, 0, nullptr, 0, "link value must be usb|tcp|auto");
+            } else {
+                snprintf(msg, sizeof(msg), "link=%s active=%s tx_frames=%u tx_kb=%u tx_drop=%u",
+                         app_usb_link_forced_name(), app_usb_link_active_name(),
+                         (unsigned)st.tx_frames, (unsigned)(st.tx_bytes / 1024),
+                         (unsigned)st.tx_drop);
+                send_result("none", nullptr, 0, nullptr, 0, msg);
+            }
+        } else {
+            snprintf(msg, sizeof(msg),
+                     "link=%s active=%s tx_frames=%u tx_kb=%u tx_drop=%u last_ms=%u",
+                     app_usb_link_forced_name(), app_usb_link_active_name(),
+                     (unsigned)st.tx_frames, (unsigned)(st.tx_bytes / 1024),
+                     (unsigned)st.tx_drop, (unsigned)st.tx_last_ms);
+            send_result("none", nullptr, 0, nullptr, 0, msg);
+        }
     } else if (strcmp(cmd, "stream") == 0) {
         /* {"cmd":"stream","value":"on"|"off","fps":10,"quality":75}
          * 图像回传（0x05）：LVGL 模拟器/上位机用它拿板端画面；value 省略=只查询状态 */

@@ -143,7 +143,9 @@ static esp_err_t stream_encode(const img_frame_t *fr, uint8_t **out, uint32_t *o
     return ESP_OK;
 }
 
-/* 8 字节头 + 数据，一次发送 */
+/* 8 字节头 + 数据：**两段式直接发送**（2026-10-16，USB 视频流）
+ * 不再为"头 + 大帧"分配整块 PSRAM 并 memcpy —— raw 614KB/帧 @10fps 时那是 6MB/s 的
+ * 无谓 PSRAM 往返（也省掉一次 malloc/free 抖动）。 */
 static esp_err_t stream_send(const img_frame_t *fr, int fmt, const uint8_t *data, uint32_t len)
 {
     static uint8_t hdr[APP_STREAM_HDR_LEN];
@@ -156,15 +158,7 @@ static esp_err_t stream_send(const img_frame_t *fr, int fmt, const uint8_t *data
     hdr[6] = (uint8_t)(s_st.seq & 0xFF);
     hdr[7] = (uint8_t)((s_st.seq >> 8) & 0xFF);
 
-    size_t total = APP_STREAM_HDR_LEN + len;
-    uint8_t *pkt = heap_caps_malloc(total, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    ESP_RETURN_ON_FALSE(pkt, ESP_ERR_NO_MEM, TAG, "pkt %u B", (unsigned)total);
-    memcpy(pkt, hdr, APP_STREAM_HDR_LEN);
-    memcpy(pkt + APP_STREAM_HDR_LEN, data, len);
-
-    esp_err_t err = app_usb_link_send(JCL_TYPE_IMAGE, pkt, (uint32_t)total);
-    heap_caps_free(pkt);
-    return err;
+    return app_usb_link_send2(JCL_TYPE_IMAGE, hdr, APP_STREAM_HDR_LEN, data, len);
 }
 
 static void stream_task(void *arg)
@@ -208,23 +202,11 @@ static void stream_task(void *arg)
         int64_t t0 = esp_timer_get_time();
 
         if (s_st.fmt == APP_STREAM_FMT_RGB565) {
-            /* 原始像素直传（不经 JPEG 编码），用于排查编码环节 */
-            size_t need = (size_t)fr.stride * (uint32_t)fr.height;
-            if (s_st.raw_cap < need) {
-                if (s_st.raw_buf) heap_caps_free(s_st.raw_buf);
-                s_st.raw_buf = heap_caps_malloc(need, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-                s_st.raw_cap = s_st.raw_buf ? need : 0;
-            }
-            if (!s_st.raw_buf) {           /* stream_task 是 void，不能用 ESP_RETURN_* */
-                app_imgpipe_release(&fr);
-                s_st.st.drop++;
-                ESP_LOGE(TAG, "raw buf %u B alloc failed", (unsigned)need);
-                vTaskDelay(pdMS_TO_TICKS(200));
-                continue;
-            }
-            memcpy(s_st.raw_buf, fr.data, need);
-            jpeg = s_st.raw_buf;
-            jpeg_len = (uint32_t)need;
+            /* 原始像素直传（不经 JPEG 编码），用于排查编码环节。
+               2026-10-16：**直接发帧池缓冲**（发送是拷贝语义，且此处仍在 release 之前），
+               不再 memcpy 到自备 raw_buf —— 省 614KB/帧 的 PSRAM 往返。 */
+            jpeg = fr.data;
+            jpeg_len = (uint32_t)((size_t)fr.stride * (uint32_t)fr.height);
         } else {
             err = stream_encode(&fr, &jpeg, &jpeg_len);
         }

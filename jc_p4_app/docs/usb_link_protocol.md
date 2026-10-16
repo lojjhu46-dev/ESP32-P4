@@ -85,7 +85,42 @@ magic "JCDF"(4) | ver u32=1 | face_len u32 | names_len u32 | names(JSON) | face.
 {"cmd":"register","id":"user1"}
 {"cmd":"delete","id":"user1"}
 {"cmd":"list"}
+{"cmd":"link"}                          // 查询当前链路
+{"cmd":"link","value":"usb"}            // 强制 USB / "tcp" / "auto"
 ```
+
+## 链路选择与切换（2026-10-16，USB 视频流）
+板端有两条**功能完全等价**的发送后端：内置 **USB CDC**（`"usb-cdc"`）与 **TCP**（`"tcp"`，
+由 `app_netlink` 在客户端连上时注册）。上层（0x02 结果 / 0x04 日志 / 0x05 图像 / 0x06 分片）
+不感知差异，全部经 `app_usb_link_send*()` 走"当前生效后端"。
+
+| 强制态 | 语义 |
+|---|---|
+| `auto`（默认） | 与历史行为一致：**TCP 客户端连上则抢占**为 tcp，断开自动回落 usb-cdc |
+| `usb` | 强制走 USB CDC；**新到的 TCP 客户端会被立即关闭**并打一行 0x04 说明；已连的 TCP 客户端会被主动断开 |
+| `tcp` | 强制走 TCP（未连接时仍落到 usb-cdc，连上即生效） |
+
+- 查询：`{"cmd":"link"}` → `event:"none"` + `msg:"link=auto active=usb-cdc tx_frames=.. tx_kb=.. tx_drop=.. last_ms=.."`
+- 设置：`{"cmd":"link","value":"usb"|"tcp"|"auto"}` → 同上 msg（非法值回 `event:"error"`）
+- **结果帧（0x02）恒带 `"link"` 字段**（`"usb-cdc"` / `"tcp"`），上位机用它显示链路徽标
+- 发送统计：`tx_frames/tx_bytes/tx_drop/tx_last_ms`（在线路切换、算吞吐和排查丢帧时很有用）
+- PC 端不需要"两条链路同时收"：切换 = 在目标接口重新连接（板子一次只服务一个 TCP 客户端）
+
+### USB 通道实测（2026-10-16，ESP32-P4 USB0 OTG，协商 **HIGH 480Mbps**）
+| 档位 | 请求 | 实测 | 带宽 | 备注 |
+|---|---|---|---|---|
+| 0x05 JPEG | 10fps | 8.3fps | 216 KB/s | 解码零失败 |
+| 0x05 JPEG | 20fps | 10.9fps | 281 KB/s | 与 30fps 同 |
+| 0x05 JPEG | 30fps | 11.0fps | 283 KB/s | 已到本配置上限 |
+| 0x05 raw RGB565 | 10fps | **2.07fps** | **1331 KB/s** | 帧完整（614400B/帧） |
+| 0x01 PC 送图 / 0x02 / 0x03 / 0x04 / 0x06 | — | ✅ 全通 | — | 0x06 备份 8312B 导出 0.61s |
+| 识别回归（`_face_r1_test.py --serial COM5`） | — | ✅ **25/25** | — | USB 与网口功能对等 |
+
+⚠️ **瓶颈与结论**：CDC 的软件 FIFO 只有 512B（`CONFIG_TINYUSB_CDC_TX_BUFSIZE`，再大**开不了机**——
+本板内部 RAM 余量 < 3.5KB，实测 4096/8192 都会 `assert failed: vApplicationGetIdleTaskMemory`），
+所以 raw 一帧要拆成 1200 个 512B 包，每包约 376µs 软件往返 → 天花板 ≈ **1.36MB/s**。
+**raw 614400B@10fps（6MB/s）在当前硬件配置下不可达**；需要 raw 时建议**单帧按需抓取**（约 0.5s/帧，
+`fmt:"raw"` + 抓到即 `off`），日常预览用 JPEG（≈8-11fps）。
 
 ## 结果 (type 0x02)
 ```json
@@ -121,6 +156,7 @@ magic "JCDF"(4) | ver u32=1 | face_len u32 | names_len u32 | names(JSON) | face.
 | `register` | **立即回 ack**（`msg:"register armed for <name>..."`）；之后第一帧含人脸就入库，那帧回 `event:"registered"` + `match:"<name>"` |
 | `delete` | 立即回 0x02：`event:"deleted"`（`msg` 带删掉几条特征）+ `lib:[...]`；不存在回 `event:"error"` |
 | `list` | 立即回 0x02：`event:"list"` + `lib:[...]` |
+| `link` | 查询/强制发送链路：`{"cmd":"link"}` 或 `{"cmd":"link","value":"usb"\|"tcp"\|"auto"}` → `event:"none"` + `msg:"link=<态> active=<后端> tx_frames=.. tx_kb=.. tx_drop=.. last_ms=.."`（详见上节「链路选择与切换」） |
 | `clear` | 立即回 0x02：`event:"deleted"`，`msg:"cleared"` |
 
 - **host 的正确姿势**：`register` → 等 ack → 再发帧。否则命令与帧的到达顺序不确定会错配

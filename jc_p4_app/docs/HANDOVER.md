@@ -1,8 +1,9 @@
 # jc_p4_app 开发接手文档（会话交接）
 
-> 交接日期：2026-09-30（**最后更新 2026-10-11，F10 特征库备份/恢复完成（JCLINK 0x06 +
-> db_export/db_import + jc_test.py db_backup/db_restore，见第廿四节）；同日 F9 容量提升：
-> 名表迁移 /storage/names.json + 人数上限 10→64，见第廿三节**；上一轮 2026-10-07：第 2 轮收口
+> 交接日期：2026-09-30（**最后更新 2026-10-16：USB 视频流 + Qt 全功能上位机（第廿五节）——
+> `link` 强制切换、USB 六类帧全通、USB 回归 25/25、`qt_host/` 上位机；⚠️ raw 10fps 不可达
+> （实测天花板 1.36MB/s，瓶颈=512B FIFO，内部 RAM 不允许放大）**；前一轮 2026-10-11：
+> F10 特征库备份/恢复（第廿四节）+ F9 容量提升（第廿三节）；2026-10-07：第 2 轮收口
 > + F8b 注册弹窗 UI 修复：F6/F7/快速通道/AE 曝光上限/F8 + esp-dl 非确定性定位）
 
 ---
@@ -175,6 +176,79 @@ DISPLAY=:0 SIM_SHOT=/mnt/d/esp32project/ESP32-P4/_dev/shots/sim SIM_SHOT_MS=900 
 - `.zcodeignore` 已忽略 `_dev/`，搜索不会被调试产物淹没。
 - 遗留：根目录有一个 Windows 把 `> nul` 当文件名造出来的 `nul` 幽灵文件（无法用常规手段删除，
   不影响任何流程；需要清理时在 **cmd** 里执行 `del \\?\D:\esp32project\ESP32-P4\nul`）。
+
+---
+
+## 廿五、USB 视频流 + Qt 全功能上位机（2026-10-16，真机验证 ✅）
+
+目标（用户原话）：**「编写程序实现高速USB口视频流传输（与网口传输功能效果相同，可以在不同的
+硬件接口限制下自由切换）」** + **「专门做个 C++/QT 全功能上位机」** + **提交到仓库分支**。
+
+### 1. 结果一句话
+USB0 OTG（协商 **HIGH 480Mbps**）通道**六类帧全通**（0x01/0x02/0x03/0x04/0x05/0x06）、
+**识别回归 25/25 在 USB 上通过**、新增 `link` 命令可**运行时强制切换 usb/tcp/auto**、
+Qt 上位机 `qt_host/`（TCP+USB 双通路、视频+检测框、全功能面板、F10 备份恢复）落地可用。
+⚠️ 但 **raw 614400B@10fps（6MB/s）不可达**，实测天花板 **1.36MB/s**（原因与替代见 §3/§4）。
+
+### 2. ⭐ USB 侧此前一直跑不起来的两个真 bug（改动前必读）
+1. **`tinyusb_cdcacm_write_queue()` 的返回值被当 `esp_err_t` 用** —— 它返回的是
+   `size_t 已入队字节数`。旧代码 `esp_err_t err = ...; if (err != ESP_OK) return err;`
+   把"成功写入 N 字节"当成错误码返回 ⇒ **USB 侧每一次发送都被判为失败**（TCP 走另一个后端，
+   所以大半年没暴露；这也是"USB 视频流从没跑起来"的根因）。
+2. **FIFO 满时 `vTaskDelay(1)` 等排水**（1 tick 粒度太粗）⇒ 吞吐被钉在 ~170KB/s。
+   改成 **μs 级忙等**（`esp_rom_delay_us(50)` × 最多 64 次，之后才让出 1 tick）：
+   JPEG 79KB/s → **283KB/s**，raw 从"大帧被截断丢弃" → **完整 1.36MB/s**。
+
+### 3. 实测数据（COM5 = VID_303A:4001；`qt_host.exe --selftest --serial COM5`）
+| 档位 | 请求 | 实测 | 带宽 | 解码失败 |
+|---|---|---|---|---|
+| 0x05 JPEG | 10fps | 8.3fps | 216 KB/s | 0 |
+| 0x05 JPEG | 20fps | 10.9fps | 281 KB/s | 0 |
+| 0x05 JPEG | 30fps | 11.0fps | 283 KB/s | 0 |
+| 0x05 raw RGB565 | 10fps | **2.07fps** | **1331 KB/s** | 0（帧完整） |
+| 0x06 备份导出 8312B | — | 0.61s | — | 0 |
+| 回归 `_face_r1_test.py --serial COM5` | — | **25/25 PASS** | — | — |
+
+**瓶颈定量**：CDC 软件 FIFO 只有 512B ⇒ raw 一帧拆 1200 个包 × 每包 ≈376µs 软件往返
+= 1.36MB/s 天花板。**不是 FS 限制**（板端日志 `USB negotiated speed = HIGH`），也不是主机侧。
+
+### 4. ⚠️ CDC FIFO 为什么不能放大（别再试，会开不了机）
+- `CONFIG_TINYUSB_CDC_TX_BUFSIZE` **512→4096 (+3.5KB)**、**8192 (+7.7KB)** 均**开机即崩**：
+  `assert failed: vApplicationGetIdleTaskMemory port_common.c:53 (pxStackBufferTemp != NULL)`
+  —— idle 任务栈都分配不出来 = **内部 RAM 耗尽**；本板内部 RAM 余量 **< 3.5KB**
+  （BLE/WiFi(esp-hosted) 启动窗口贴零线，见第廿三节的同类教训）。
+- 真要提速只有两条路：① 把 CDC FIFO 改到 PSRAM（改 tinyusb 组件 + 处理 DMA 缓存一致性，有风险）；
+  ② 把 raw 需求改成**按需单帧抓取**（614KB ≈ 0.5s，抓完即 `stream off`），日常预览用 JPEG。
+- 文件里已保留实测注释（`sdkconfig.defaults`）说明这些数字的来历。
+
+### 5. `link` 命令与"自由切换"（协议细节见 `docs/usb_link_protocol.md`）
+- `{"cmd":"link"}` 查询 / `{"cmd":"link","value":"usb"|"tcp"|"auto"}` 强制；结果帧**恒带 `link` 字段**。
+- `auto`（默认）保持历史语义：TCP 客户端连上抢占、断开回落 CDC；
+  **强制 `usb` 时新 TCP 客户端被拒绝、已连的会被断开**并打 0x04 说明（否则"USB 发命令、TCP 看不到应答"极易误判为故障）。
+- 发送统计 `tx_frames/tx_bytes/tx_drop/tx_last_ms` 随 `link` 应答返回（切换与吞吐排查都用它）。
+
+### 6. Qt 上位机 `qt_host/`（构建与用法见其 README）
+落地过程中踩到并**已修**的 6 个坑（都是"看起来像玄学"的那种）：
+1. **`Qt6SerialPort` 模块本机未安装** → 串口用 Win32 自实现（`CreateFile` + `SetupComm(1MB)` + 读线程）。
+2. **必须禁用系统代理** `QNetworkProxy::NoProxy`，否则直连局域网报
+   `The proxy type is invalid for this operation`。
+3. **头文件必须列进 CMake target**，否则 AUTOMOC 不生成 moc ⇒ 链接报
+   `undefined reference to ITransport::staticMetaObject / vtable`。
+4. **`windeployqt` 不能加 `--no-compiler-runtime`** ⇒ 否则启动即 `0xC0000135`（缺 MinGW 运行库）。
+5. **`build.ps1` 必须 ASCII-only**（PowerShell 5.1 按 ANSI 读 .ps1，中文注释会导致解析失败）。
+6. **阻塞读不可取消会把 COM 口连驱动一起卡死**：实测进程被杀后 COM5 一直
+   `ERROR_ACCESS_DENIED`，只能复位板子重枚举 ⇒ 已改 **`FILE_FLAG_OVERLAPPED` 可取消读**，
+   并给自检加**硬看门狗**（到点 `std::_Exit(4)`）——自动化验收绝不允许悬挂。
+
+视频解码验证：JPEG 与 raw 各 dump 一帧 PNG 对比，画面一致 ⇒ **RGB565 raw 无需字节序交换**（默认直映射正确）。
+
+### 7. 连板纪律（并存时最容易踩）
+- 板子**一次只服务一个 TCP 客户端**；USB 与 TCP 的 RX 会**同时**喂同一解析器（这是故意的：
+  两条链路都能发命令），所以"强制 usb"时才要拒绝 TCP 客户端。
+- **串口号会变**：重插后 CH340 从 COM4 → **COM3**、P4 CDC 为 **COM5**。
+  写脚本/文档别写死端口，用 `[System.IO.Ports.SerialPort]::GetPortNames()` 现查。
+- 网口不可用时（例如网线没插）**回归也能走 USB**：`_face_r1_test.py --serial COM5`（2026-10-16 新增）。
+  跑回归前先 `jc_test.py --serial COM5 db_backup x.bin` 备份用户库（回归每阶段开头会 `clear`）。
 
 ---
 

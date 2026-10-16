@@ -7,6 +7,7 @@
 #include "esp_log.h"
 #include "esp_check.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "tinyusb.h"
 #include "tinyusb_default_config.h"
 #include "tinyusb_cdc_acm.h"
@@ -16,7 +17,11 @@
 #define TAG "usb_link"
 
 #define RING_SIZE      (128 * 1024)   /* rx ring buffer (PSRAM) */
-#define TX_CHUNK       (4096)         /* max bytes per write_queue call */
+#define TX_CHUNK       (8192)         /* 每次 write_queue 的块大小（与
+                                         CONFIG_TINYUSB_CDC_TX_BUFSIZE=8KB 对齐）：
+                                         块太小 → 频繁等排水，USB HS 吞吐上不去 */
+#define TX_BUDGET_US   (500000)       /* 单帧发送总预算（与 TCP 后端一致）：超预算即丢帧
+                                         （返回 ESP_ERR_TIMEOUT），绝不把 AI/stream 拖死 */
 #define CDC_ITF        TINYUSB_CDC_ACM_0
 #define JCL_MAGIC0     0x4A
 #define JCL_MAGIC1     0x43
@@ -38,12 +43,17 @@ typedef struct {
     uint8_t  *f_buf;             /* current frame payload buffer */
     SemaphoreHandle_t tx_lock;
     SemaphoreHandle_t rx_lock;   /* 串行化多个后端的字节注入 */
-    const jcl_transport_t *tp;   /* 当前发送后端，NULL = 内置 USB CDC */
+    const jcl_transport_t *tp;   /* 当前**生效**的发送后端，NULL = 内置 USB CDC */
+    const jcl_transport_t *net_tp; /* 外部（TCP）后端是否存在：由 app_netlink 注册 */
+    uint8_t   forced;            /* 强制态：0=auto 1=usb 2=tcp（2026-10-16） */
     volatile bool cdc_up;        /* USB 主机在不在（tinyusb ATTACHED/DETACHED） */
     TickType_t send_fail_tick;   /* 发送失败日志限流 */
     void    (*cmd_cb)(const char *json, uint32_t len);
     void    (*blob_cb)(const uint8_t *data, uint32_t len);   /* 0x06 块数据（F10） */
     uint32_t  dropped;
+
+    /* 发送统计（2026-10-16，link 命令与上位机状态栏用） */
+    app_usb_link_stats_t tx;
 
     /* latest complete JPEG frame slot (window=1 protocol) */
     uint8_t  *jpeg_buf;
@@ -221,31 +231,63 @@ static void usb_rx_task(void *arg)
 
 /* ---------------- 传输层后端 ---------------- */
 
+/* USB CDC 写入（2026-10-16 重写）。
+ * ⚠️ 关键坑：esp_tinyusb v2 的 `tinyusb_cdcacm_write_queue()` 返回 **size_t 已入队字节数**，
+ *   不是 esp_err_t！旧代码 `esp_err_t err = tinyusb_cdcacm_write_queue(...); if (err != ESP_OK)
+ *   return err;` 把"成功写入 N 字节"当成错误码返回 → **USB 侧每一次 send 都被判为失败**
+ *   （TCP 走另一个后端，所以一直没暴露；这也是 USB 视频流从没跑起来的原因）。
+ *   正确用法：按返回值推进，返回 0 = FIFO 满。
+ * 策略与 TCP 后端一致：非阻塞推进 + 总预算（TX_BUDGET_US），超预算丢帧不阻塞调用者。 */
 static esp_err_t cdc_write(const uint8_t *data, uint32_t len)
 {
     if (!s_lk.cdc_up) {
-        /* 没插 USB 主机（比如 PC 只走网线）时直接失败：否则 flush 会白等 100ms
-           并且每帧刷一条 "Flush failed"，把串口/CPU 拖死 */
+        /* 没插 USB 主机（比如 PC 只走网线）时直接失败，避免白等 */
         return ESP_ERR_INVALID_STATE;
     }
+    int64_t t0 = esp_timer_get_time();
     const uint8_t *p = data;
     uint32_t left = len;
+    int spins = 0;
     while (left > 0) {
         uint32_t n = left > TX_CHUNK ? TX_CHUNK : left;
-        esp_err_t err = tinyusb_cdcacm_write_queue(CDC_ITF, p, n);
-        if (err != ESP_OK) return err;
-        p += n;
-        left -= n;
+        size_t queued = tinyusb_cdcacm_write_queue(CDC_ITF, p, n);
+        if (queued == 0) {
+            /* FIFO 满：等 tinyusb 把 FIFO 抽干。
+             * ⚠️ 2026-10-16 实测教训：这里原先用 `vTaskDelay(1)`（= 1 个 tick）——
+             * 512B FIFO 每抽一次就等一整 tick，吞吐被死死钉在 ~170KB/s
+             * （USB 下 JPEG 只能到 10.5fps，raw 614KB 帧直接超预算被截断）。
+             * 改成 **μs 级忙等**（tinyusb 任务优先级更高会抢占，或跑在另一核）：
+             * 连续忙等 64 次后再让出 1 tick，兼顾吞吐与不饿死其它任务。 */
+            if (esp_timer_get_time() - t0 > TX_BUDGET_US) {
+                return ESP_ERR_TIMEOUT;
+            }
+            if (++spins < 64) {
+                esp_rom_delay_us(50);
+            } else {
+                spins = 0;
+                vTaskDelay(1);
+            }
+            continue;
+        }
+        /* 主动泵一次端点：缩短 FIFO 占用时间（非阻塞，未冲完也返回） */
+        tinyusb_cdcacm_write_flush(CDC_ITF, 0);
+        p += queued;
+        left -= (uint32_t)queued;
     }
     return ESP_OK;
 }
 
+/* 帧尾 flush：非阻塞泵一次即可。数据已拷进 tinyusb 软件 FIFO（tud_cdc_n_write 是拷贝
+   语义），调用方缓冲可立即复用；未冲完不算错误，后台任务会继续排。
+   旧实现每帧 `write_flush(100)` 白等 100ms —— raw 10fps（614KB/帧）下会直接把吞吐
+   压到 6MB/s 以下。 */
 static esp_err_t cdc_flush(void)
 {
     if (!s_lk.cdc_up) {
         return ESP_ERR_INVALID_STATE;
     }
-    return tinyusb_cdcacm_write_flush(CDC_ITF, 100);
+    tinyusb_cdcacm_write_flush(CDC_ITF, 0);
+    return ESP_OK;
 }
 
 static void tusb_event_cb(tinyusb_event_t *ev, void *arg)
@@ -254,6 +296,12 @@ static void tusb_event_cb(tinyusb_event_t *ev, void *arg)
     if (ev->id == TINYUSB_EVENT_ATTACHED) {
         s_lk.cdc_up = true;
         ESP_LOGI(TAG, "USB host attached -> CDC link up");
+        /* 2026-10-16：把协商速率打出来——USB 视频流的天花板直接取决于 FS/HS
+           （FS 理论 1.216MB/s；实测 raw 只到 1.36MB/s，需先判断是硬件 FS 受限
+           还是 512B FIFO 的每包软件开销受限）。 */
+        const tusb_speed_t sp = tud_speed_get();
+        ESP_LOGW(TAG, "USB negotiated speed = %s", sp == TUSB_SPEED_HIGH ? "HIGH (480Mbps, 上限~60MB/s)"
+                                    : sp == TUSB_SPEED_FULL ? "FULL (12Mbps, 上限~1.2MB/s)" : "UNKNOWN");
     } else if (ev->id == TINYUSB_EVENT_DETACHED) {
         s_lk.cdc_up = false;
         ESP_LOGW(TAG, "USB host detached -> CDC link down");
@@ -266,10 +314,65 @@ static const jcl_transport_t s_cdc_tp = {
     .flush = cdc_flush,
 };
 
+/* 依据"强制态 + 是否有外部后端"重算生效后端（2026-10-16）：
+   auto（默认）TCP 优先级与历史行为一致：客户端连上抢占、断开由 set_transport(NULL) 回落。 */
+static void apply_backend(void)
+{
+    const jcl_transport_t *want = NULL;         /* NULL = 内置 USB CDC */
+    if (s_lk.forced == 1) {                     /* 强制 usb */
+        want = NULL;
+    } else {                                    /* auto / 强制 tcp：都用外部后端（没连上则是 CDC） */
+        want = s_lk.net_tp;
+    }
+    s_lk.tp = want;
+}
+
+bool app_usb_link_force_backend(const char *name)
+{
+    uint8_t want;
+    if (!name || !strcmp(name, "auto")) {
+        want = 0;
+    } else if (!strcmp(name, "usb")) {
+        want = 1;
+    } else if (!strcmp(name, "tcp")) {
+        want = 2;
+    } else {
+        return false;
+    }
+    s_lk.forced = want;
+    apply_backend();
+    ESP_LOGW(TAG, "link forced=%s -> active=%s", app_usb_link_forced_name(),
+             app_usb_link_active_name());
+    app_usb_link_log("usblink: link=%s active=%s", app_usb_link_forced_name(),
+                     app_usb_link_active_name());
+    return true;
+}
+
+const char *app_usb_link_active_name(void)
+{
+    return s_lk.tp ? s_lk.tp->name : s_cdc_tp.name;
+}
+
+const char *app_usb_link_forced_name(void)
+{
+    switch (s_lk.forced) {
+    case 1:  return "usb";
+    case 2:  return "tcp";
+    default: return "auto";
+    }
+}
+
+bool app_usb_link_usb_forced(void)
+{
+    return s_lk.forced == 1;
+}
+
 void app_usb_link_set_transport(const jcl_transport_t *tp)
 {
-    s_lk.tp = tp;
-    ESP_LOGI(TAG, "tx backend -> %s", tp ? tp->name : s_cdc_tp.name);
+    s_lk.net_tp = tp;
+    apply_backend();
+    ESP_LOGI(TAG, "tx backend -> %s (forced=%s)", app_usb_link_active_name(),
+             app_usb_link_forced_name());
 }
 
 void app_usb_link_feed(const uint8_t *data, uint32_t len)
@@ -297,24 +400,35 @@ bool app_usb_link_ready(void)
 
 /* ---- public API ---- */
 
-esp_err_t app_usb_link_send(uint8_t type, const void *payload, uint32_t len)
+/* 组帧发送公共实现：帧 = hdr | payload，帧长 = hdr_len + payload_len（两段之间无间隙）。
+   0x05 大帧走这里可以"8B 头 + 614KB 数据"分两次写，省掉一整块 PSRAM 与一次 memcpy。 */
+static esp_err_t send_vect(uint8_t type,
+                           const void *hdr, uint32_t hdr_len,
+                           const void *payload, uint32_t payload_len)
 {
     if (!s_lk.tx_lock) return ESP_ERR_INVALID_STATE;
-    if (len > JCL_MAX_PAYLOAD) return ESP_ERR_INVALID_SIZE;
+    uint64_t len64 = (uint64_t)hdr_len + (uint64_t)payload_len;
+    if (len64 > JCL_MAX_PAYLOAD) return ESP_ERR_INVALID_SIZE;
 
+    uint32_t len = (uint32_t)len64;
     static uint8_t seq;
-    uint8_t hdr[8] = { JCL_MAGIC0, JCL_MAGIC1, type, 0, 0, 0, 0, 0 };
-    hdr[3] = ++seq;
-    memcpy(&hdr[4], &len, 4);
-    uint16_t crc = crc16_ccitt(&hdr[2], 6, 0xFFFF);
-    crc = crc16_ccitt(payload, len, crc);
+    uint8_t h[8] = { JCL_MAGIC0, JCL_MAGIC1, type, 0, 0, 0, 0, 0 };
+    h[3] = ++seq;
+    memcpy(&h[4], &len, 4);
+    uint16_t crc = crc16_ccitt(&h[2], 6, 0xFFFF);
+    crc = crc16_ccitt(hdr, hdr_len, crc);
+    crc = crc16_ccitt(payload, payload_len, crc);
     uint8_t crc_b[2] = { (uint8_t)(crc & 0xFF), (uint8_t)(crc >> 8) };
 
+    int64_t t0 = esp_timer_get_time();
     xSemaphoreTake(s_lk.tx_lock, portMAX_DELAY);
     const jcl_transport_t *tp = s_lk.tp ? s_lk.tp : &s_cdc_tp;
-    esp_err_t err = tp->write(hdr, sizeof(hdr));
-    if (err == ESP_OK && len) {
-        err = tp->write((const uint8_t *)payload, len);
+    esp_err_t err = tp->write(h, sizeof(h));
+    if (err == ESP_OK && hdr_len) {
+        err = tp->write(hdr, hdr_len);
+    }
+    if (err == ESP_OK && payload_len) {
+        err = tp->write(payload, payload_len);
     }
     if (err == ESP_OK) {
         err = tp->write(crc_b, sizeof(crc_b));
@@ -323,7 +437,13 @@ esp_err_t app_usb_link_send(uint8_t type, const void *payload, uint32_t len)
         err = tp->flush();
     }
     xSemaphoreGive(s_lk.tx_lock);
-    if (err != ESP_OK) {
+
+    if (err == ESP_OK) {
+        s_lk.tx.tx_frames++;
+        s_lk.tx.tx_bytes += (uint64_t)sizeof(h) + len + sizeof(crc_b);
+        s_lk.tx.tx_last_ms = (uint32_t)((esp_timer_get_time() - t0) / 1000);
+    } else {
+        s_lk.tx.tx_drop++;
         /* 限流：断链时每帧都失败，不能每帧刷一条（会拖慢串口/CPU） */
         TickType_t now = xTaskGetTickCount();
         if (now - s_lk.send_fail_tick > pdMS_TO_TICKS(5000)) {
@@ -333,6 +453,23 @@ esp_err_t app_usb_link_send(uint8_t type, const void *payload, uint32_t len)
         }
     }
     return err;
+}
+
+esp_err_t app_usb_link_send(uint8_t type, const void *payload, uint32_t len)
+{
+    return send_vect(type, NULL, 0, payload, len);
+}
+
+esp_err_t app_usb_link_send2(uint8_t type,
+                             const void *hdr, uint32_t hdr_len,
+                             const void *payload, uint32_t payload_len)
+{
+    return send_vect(type, hdr, hdr_len, payload, payload_len);
+}
+
+void app_usb_link_get_stats(app_usb_link_stats_t *out)
+{
+    if (out) *out = s_lk.tx;
 }
 
 void app_usb_link_log(const char *fmt, ...)
@@ -401,5 +538,9 @@ esp_err_t app_usb_link_init(void)
 
     ESP_LOGI(TAG, "JCLINK v1 ready: ring=%dKB PSRAM, frame 'JC'|type|seq|len|payload|crc16",
              RING_SIZE / 1024);
+    /* 构建标记（2026-10-16）：USB 视频流 + link 强制切换特性，便于确认板端跑的是哪一版 */
+    ESP_LOGW(TAG, "link-feature build %s %s (CDC tx=%d rx=%d, TX_CHUNK=%d, budget=%dms)",
+             __DATE__, __TIME__, CONFIG_TINYUSB_CDC_TX_BUFSIZE, CONFIG_TINYUSB_CDC_RX_BUFSIZE,
+             TX_CHUNK, TX_BUDGET_US / 1000);
     return ESP_OK;
 }
