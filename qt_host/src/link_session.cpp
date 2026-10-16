@@ -186,6 +186,8 @@ void LinkSession::handleFrame(const jcl::Frame &f)
         VideoFrame vf;
         QString err;
         if (decodeImageFrame(f.payload, m_swapRaw, &vf, &err)) {
+            m_st.lastRaw = (vf.fmt == 1);
+            m_st.lastBytes = vf.bytes;
             emit videoFrame(vf);
             /* ① 路线：raw 按需单帧抓取（见 startRawGrab）——收到第一张 raw 帧即落盘并停流 */
             if (!m_grab.path.isEmpty() && vf.fmt == 1) {

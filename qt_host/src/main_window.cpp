@@ -129,14 +129,18 @@ MainWindow::MainWindow(QWidget *parent)
     connect(m_link, &LinkSession::statsChanged, this, [this](const LinkSession::Stats &st) {
         m_sbTraffic->setText(QStringLiteral("RX %1 KB · TX %2 KB")
                                  .arg(st.rxBytes / 1024).arg(st.txBytes / 1024));
-        m_sbFps->setText(QStringLiteral("%1 fps · %2 KB/s")
-                             .arg(st.imgFps, 0, 'f', 1).arg(st.imgKbps, 0, 'f', 0));
+        m_sbFps->setText(QStringLiteral("%1 %2 fps · %3 KB/s")
+                             .arg(st.lastRaw ? QStringLiteral("raw") : QStringLiteral("jpeg"))
+                             .arg(st.imgFps, 0, 'f', 1)
+                             .arg(st.imgKbps, 0, 'f', 0));
         m_sbDrop->setText(QStringLiteral("丢帧 %1").arg(st.imgDrop));
-        m_view->setStatsText(QStringLiteral("%1 fps  %2 KB/s  丢%3  %4")
-                                 .arg(st.imgFps, 0, 'f', 1)
-                                 .arg(st.imgKbps, 0, 'f', 0)
+        /* 角标带上实际格式：一眼看出"UI 选 JPEG 但板子在推 raw"这类不一致 */
+        m_view->setStatsText(QStringLiteral("%1 %2 fps  %3 KB/s  丢%4  %5")
+                                 .arg(st.lastRaw ? QStringLiteral("raw") : QStringLiteral("jpeg"),
+                                      QString::number(st.imgFps, 'f', 1),
+                                      QString::number(st.imgKbps, 'f', 0))
                                  .arg(st.imgDrop)
-                                 .arg(m_link->stats().link));
+                                 .arg(st.link));
         if (!st.link.isEmpty() && st.link != QLatin1String("-")) {
             m_linkBadge->setText(st.link);
             m_linkBadge->setProperty("state", st.link == QLatin1String("tcp") ? QStringLiteral("tcp")
@@ -159,6 +163,21 @@ MainWindow::MainWindow(QWidget *parent)
                 } else {
                     statusError(QStringLiteral("raw 单帧抓取失败（超时或未连接）：%1").arg(path));
                 }
+                /* 抓帧会把板端 stream 临时切到 raw 且关流 —— 若之前在看预览，用 UI 当前
+                   的 fmt/fps/quality 自动恢复（否则会出现"UI 是 JPEG、板子还在推 raw"的假低帧率）。 */
+                if (m_streamBeforeGrab && m_link->isConnected()) {
+                    m_streamBeforeGrab = false;
+                    QJsonObject o = cmdObj(QStringLiteral("stream"), QStringLiteral("value"),
+                                           QStringLiteral("on"));
+                    o.insert(QStringLiteral("fps"), m_fpsSpin->value());
+                    o.insert(QStringLiteral("quality"), m_qSpin->value());
+                    o.insert(QStringLiteral("fmt"), m_fmtBox->currentData().toString());
+                    cmd(o);
+                    appendLog(QStringLiteral("↺ 已恢复预览流（%1 %2fps）")
+                                  .arg(m_fmtBox->currentData().toString())
+                                  .arg(m_fpsSpin->value()));
+                }
+                m_streamBeforeGrab = false;
             });
     connect(m_link, &LinkSession::dbDone, this, [this](bool ok, const QString &msg) {
         m_dbBar->setValue(ok ? 100 : m_dbBar->value());
@@ -337,8 +356,22 @@ void MainWindow::buildUi()
     connect(m_streamBtn, &QPushButton::clicked, this, [this]() {
         if (!m_link->isConnected()) { statusError(QStringLiteral("请先连接")); return; }
         const bool want = !m_streamOn;
-        cmd(cmdObj(QStringLiteral("stream"), QStringLiteral("value"),
-                   want ? QStringLiteral("on") : QStringLiteral("off")));
+        QJsonObject o = cmdObj(QStringLiteral("stream"), QStringLiteral("value"),
+                               want ? QStringLiteral("on") : QStringLiteral("off"));
+        if (want) {
+            /* ⚠️ 必须带 fmt/fps/quality：板端的 fmt 可能停在 raw（例如刚用过"抓一帧 raw"），
+               只发 stream on 会继续推 raw 614KB/帧 ≈2.3fps，看起来就是"预览只有两三帧"。
+               2026-10-16 实测踩到：UI 显示 JPEG、实际在推 raw。 */
+            o.insert(QStringLiteral("fps"), m_fpsSpin->value());
+            o.insert(QStringLiteral("quality"), m_qSpin->value());
+            o.insert(QStringLiteral("fmt"), m_fmtBox->currentData().toString());
+        }
+        cmd(o);
+        appendLog(QStringLiteral("→ %1（%2 %3fps q%4）")
+                      .arg(want ? QStringLiteral("开始流") : QStringLiteral("停止流"),
+                           m_fmtBox->currentData().toString())
+                      .arg(m_fpsSpin->value())
+                      .arg(m_qSpin->value()));
     });
 
     /* 快捷键 */
@@ -444,6 +477,7 @@ QWidget *MainWindow::buildStreamTab()
         QDir().mkpath(dir);
         const QString path = QDir(dir).filePath(
             QStringLiteral("raw_%1.png").arg(QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss")));
+        m_streamBeforeGrab = m_streamOn;      /* 抓完自动恢复预览（用 UI 当前的 fmt） */
         appendLog(QStringLiteral("→ 抓一帧 raw（自动 开流→取帧→停流）…"));
         m_link->startRawGrab(path);
     });

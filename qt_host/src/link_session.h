@@ -27,6 +27,10 @@ public:
         double  imgFps = 0.0;
         double  imgKbps = 0.0;
         quint32 imgDrop = 0;             /* 解码失败帧数 */
+        /* 实际收到的图像格式/大小（2026-10-16）：板端 stream 的 fmt 可能与 UI 选择不一致
+         * （例如"抓一帧 raw"把板端切到 raw 后没切回来），显示出来才能一眼看出。 */
+        bool    lastRaw = false;
+        int     lastBytes = 0;
         QString link = QStringLiteral("-");   /* 板端结果帧里的 link 字段（usb-cdc / tcp） */
         QString lastLog;
     };

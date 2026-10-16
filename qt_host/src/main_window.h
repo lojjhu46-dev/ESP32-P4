@@ -126,5 +126,6 @@ private:
 
     bool m_syncing = false;      /* 结果帧回填控件时抑制回发命令 */
     bool m_streamOn = false;
+    bool m_streamBeforeGrab = false;   /* 抓 raw 前流是否开着（抓完自动恢复预览） */
     int  m_gainMax = 192, m_expMax = 994;
 };
