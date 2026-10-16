@@ -2,6 +2,7 @@
 
 #include <QCoreApplication>
 #include <QDateTime>
+#include <QEventLoop>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QTextStream>
@@ -38,6 +39,7 @@ int runSelfTest(const QStringList &args)
     int      quality = 75;
     bool     swap = false;
     QString  dumpPath;
+    QString  grabRawPath;
 
     for (int i = 0; i < args.size(); i++) {
         const QString a = args.at(i);
@@ -67,6 +69,8 @@ int runSelfTest(const QStringList &args)
             swap = true;
         } else if (a == QLatin1String("--dump")) {
             dumpPath = next();
+        } else if (a == QLatin1String("--grab-raw")) {
+            grabRawPath = next();
         }
     }
 
@@ -130,6 +134,30 @@ int runSelfTest(const QStringList &args)
 
     s.sendCmd(cmd("link"));
     s.sendCmd(cmd("list"));
+
+    /* ① 路线专项：raw 按需单帧抓取（脚本化验证；顺带可当命令行工具用） */
+    if (!grabRawPath.isEmpty()) {
+        QEventLoop loop;
+        bool ok = false;
+        int bytes = 0, w = 0, h = 0;
+        QObject::connect(&s, &LinkSession::rawGrabDone,
+                         [&](bool o, const QString &, int b, int ww, int hh) {
+                             ok = o;
+                             bytes = b;
+                             w = ww;
+                             h = hh;
+                             loop.quit();
+                         });
+        s.startRawGrab(grabRawPath, 8000);
+        QTimer::singleShot(9000, &loop, &QEventLoop::quit);
+        loop.exec();
+        out << QStringLiteral("grab-raw: ok=%1 %2x%3 data=%4B path=%5\n")
+                   .arg(ok ? 1 : 0).arg(w).arg(h).arg(bytes).arg(grabRawPath);
+        out << (ok ? QStringLiteral("SELFTEST PASS") : QStringLiteral("SELFTEST FAIL")) << "\n";
+        out.flush();
+        s.close();
+        return ok ? 0 : 1;
+    }
 
     QTimer::singleShot(250, [&]() {
         s.sendCmd(cmd("stream", "value", QStringLiteral("on")));

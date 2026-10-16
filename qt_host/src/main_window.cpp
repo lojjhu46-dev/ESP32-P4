@@ -150,6 +150,16 @@ MainWindow::MainWindow(QWidget *parent)
         m_dbBar->setValue(pct);
         m_dbLabel->setText(text);
     });
+    connect(m_link, &LinkSession::rawGrabDone, this,
+            [this](bool ok, const QString &path, int bytes, int w, int h) {
+                if (ok) {
+                    appendLog(QStringLiteral("✓ raw 单帧已保存：%1（%2x%3, %4 B）")
+                                  .arg(path).arg(w).arg(h).arg(bytes));
+                    m_sbLog->setText(QStringLiteral("raw 单帧已保存：%1").arg(path));
+                } else {
+                    statusError(QStringLiteral("raw 单帧抓取失败（超时或未连接）：%1").arg(path));
+                }
+            });
     connect(m_link, &LinkSession::dbDone, this, [this](bool ok, const QString &msg) {
         m_dbBar->setValue(ok ? 100 : m_dbBar->value());
         m_dbLabel->setText((ok ? QStringLiteral("✓ ") : QStringLiteral("✗ ")) + msg);
@@ -367,9 +377,14 @@ QWidget *MainWindow::buildStreamTab()
 
     auto *apply = button(QStringLiteral("下发流参数"), QStringLiteral("primary"));
     v->addWidget(apply);
+    /* ① 路线（2026-10-16）：raw 连续流只有 ~1.4MB/s（≈2.3fps），但单帧 0.5s 就能拿到，
+       颜色标定/取证足够——一键"开流( raw )→取一帧→停流→存 PNG"。 */
+    auto *grabRawBtn = button(QStringLiteral("抓一帧 raw → PNG"));
+    v->addWidget(grabRawBtn);
     v->addStretch(1);
-    v->addWidget(dimLabel(QStringLiteral("提示：raw 档 614KB/帧，10fps ≈ 6MB/s——USB HS 才吃得下；\n"
-                                         "看颜色/调参请用 raw，日常预览用 JPEG。")));
+    v->addWidget(dimLabel(QStringLiteral("提示：raw 档 614KB/帧，连续推流实测 ~1.4MB/s（≈2.3fps）；\n"
+                                         "「抓一帧 raw」会自动开流→取帧→停流（约 0.5s）。\n"
+                                         "JPEG 档可稳定 ~8-11fps，日常预览用它。")));
 
     /* 滑块 <-> 数字框联动 */
     connect(m_fpsS, &QSlider::valueChanged, m_fpsSpin, &QSpinBox::setValue);
@@ -386,6 +401,19 @@ QWidget *MainWindow::buildStreamTab()
         o.insert(QStringLiteral("fmt"), m_fmtBox->currentData().toString());
         cmd(o);
         cmd(cmdObj(QStringLiteral("src"), QStringLiteral("value"), m_srcBox->currentData().toString()));
+    });
+
+    connect(grabRawBtn, &QPushButton::clicked, this, [this]() {
+        if (!m_link->isConnected()) {
+            statusError(QStringLiteral("请先连接"));
+            return;
+        }
+        const QString dir = QDir(QCoreApplication::applicationDirPath()).filePath(QStringLiteral("shots"));
+        QDir().mkpath(dir);
+        const QString path = QDir(dir).filePath(
+            QStringLiteral("raw_%1.png").arg(QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss")));
+        appendLog(QStringLiteral("→ 抓一帧 raw（自动 开流→取帧→停流）…"));
+        m_link->startRawGrab(path);
     });
 
     connect(m_srcBox, &QComboBox::currentIndexChanged, this, [this](int) {

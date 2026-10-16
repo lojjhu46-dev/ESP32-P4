@@ -187,6 +187,21 @@ void LinkSession::handleFrame(const jcl::Frame &f)
         QString err;
         if (decodeImageFrame(f.payload, m_swapRaw, &vf, &err)) {
             emit videoFrame(vf);
+            /* ① 路线：raw 按需单帧抓取（见 startRawGrab）——收到第一张 raw 帧即落盘并停流 */
+            if (!m_grab.path.isEmpty() && vf.fmt == 1) {
+                const QString path = m_grab.path;
+                const int bytes = vf.bytes, w = vf.width, h = vf.height;
+                m_grab.path.clear();
+                if (m_grab.timer) {
+                    m_grab.timer->stop();
+                }
+                QJsonObject off;
+                off.insert(QStringLiteral("cmd"), QStringLiteral("stream"));
+                off.insert(QStringLiteral("value"), QStringLiteral("off"));
+                sendCmd(off);
+                const bool ok = vf.image.save(path, "PNG");
+                emit rawGrabDone(ok, path, bytes, w, h);
+            }
         } else {
             m_st.imgDrop++;
             emit decodeError(err);
@@ -318,6 +333,43 @@ void LinkSession::dbExport(const QString &path)
                                .arg(m_db.expectSize)
                                .arg(dbx.value(QStringLiteral("parts")).toInt()));
     }, 5000);
+}
+
+void LinkSession::startRawGrab(const QString &pngPath, int timeoutMs)
+{
+    if (pngPath.isEmpty() || !isConnected()) {
+        emit rawGrabDone(false, pngPath, 0, 0, 0);
+        return;
+    }
+    if (rawGrabBusy()) {
+        emit rawGrabDone(false, pngPath, 0, 0, 0);      /* 已有抓取在跑 */
+        return;
+    }
+    m_grab.path = pngPath;
+    if (!m_grab.timer) {
+        m_grab.timer = new QTimer(this);
+        m_grab.timer->setSingleShot(true);
+        connect(m_grab.timer, &QTimer::timeout, this, [this]() {
+            if (m_grab.path.isEmpty()) {
+                return;
+            }
+            const QString p = m_grab.path;
+            m_grab.path.clear();
+            QJsonObject off;
+            off.insert(QStringLiteral("cmd"), QStringLiteral("stream"));
+            off.insert(QStringLiteral("value"), QStringLiteral("off"));
+            sendCmd(off);
+            emit rawGrabDone(false, p, 0, 0, 0);        /* 超时：流已停，库/画面不受影响 */
+        });
+    }
+    m_grab.timer->start(timeoutMs);
+
+    QJsonObject on;
+    on.insert(QStringLiteral("cmd"), QStringLiteral("stream"));
+    on.insert(QStringLiteral("value"), QStringLiteral("on"));
+    on.insert(QStringLiteral("fps"), 5);                 /* raw 单帧 ~0.43s，5fps 足够且不压链路 */
+    on.insert(QStringLiteral("fmt"), QStringLiteral("raw"));
+    sendCmd(on);
 }
 
 void LinkSession::dbImport(const QString &path)

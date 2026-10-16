@@ -72,21 +72,33 @@ qt_host\build\qt_host.exe --selftest --serial COM5 --seconds 7 --images 3 --fps 
 `--swap` raw 字节序交换 · `--dump <png>` 把最后一帧存图。
 退出码 `0`=PASS、`1`=FAIL、`2`=连不上。
 
-## 6. USB 实测数据（2026-10-16，COM5 = VID_303A:4001）
+## 6. USB 实测数据（2026-10-16，COM5 = VID_303A:4001，协商 **HIGH 480Mbps**）
 
-板端协商速率 **HIGH (480Mbps)**；受限于 CDC TX FIFO 只能 512B（内部 RAM 原因），
-持续吞吐天花板约 **1.36MB/s**：
+口径 = 板端 tx 计数 − 空闲基线（工具：`pc_host/_usb_bench.py`）；带宽可靠、帧率由带宽÷帧长推算：
 
-| 档位 | 请求 | 实测帧率 | 实测带宽 | 解码失败 |
+| 档位 | 实测带宽（中位） | 平均帧长 | 推算帧率 | 解码失败 |
 |---|---|---|---|---|
-| JPEG 10fps | 10 | 8.3 fps | 216 KB/s | 0 |
-| JPEG 20fps | 20 | 10.9 fps | 281 KB/s | 0 |
-| JPEG 30fps | 30 | 11.0 fps | 283 KB/s | 0 |
-| **raw 10fps** | 10 | **2.07 fps** | **1331 KB/s** | 0（帧完整） |
+| JPEG 10fps | **217 KB/s** | ~26 KB | ~8.3 fps | 0 |
+| JPEG 20fps | **292 KB/s** | ~26 KB | ~11.2 fps | 0 |
+| JPEG 30fps | **281 KB/s** | ~26 KB | ~10.8 fps | 0 |
+| **raw 10fps** | **1390 KB/s**（±0.5%） | 600 KB | **~2.3 fps** | 0（帧完整） |
 
-结论：**JPEG 档可用**（≈8-11fps）；**raw 614KB@10fps（6MB/s）在本硬件配置下不可达**
-——瓶颈是 512B FIFO 的每包软件往返（≈376µs/包），拉大 FIFO 需要 3.5KB 以上内部 RAM 而本板已无余量。
-需要 raw 时建议：单帧按需抓取（0.5s/帧）而不是连续推流。
+**CDC FIFO 扫描结论：放大无益**（512 最优；1024/2048 更慢；4096/8192 开不了机——内部 RAM 余量 <3.5KB）。
+把 FIFO 搬到 PSRAM 也不可行（P4 的 USB DMA 只能访问内部 DRAM：`SOC_DMA_LOW/HIGH=0x4ff00000..0x4ffc0000`）。
+
+⇒ **路线 = JPEG 预览（8~11fps）+ raw 按需单帧抓取**：
+- UI「流」页有 **`抓一帧 raw → PNG`** 按钮（自动 开流[raw,fps=5] → 取第一帧 → 停流 → 存 `shots/raw_*.png`，约 0.5s）
+- 脚本：`qt_host.exe --selftest --serial COM5 --grab-raw out.png` → `grab-raw: ok=1 640x480 data=614400B`
+
+⚠️ 测吞吐时**必须持续读**（CDC 背压），且**不能在流中发查询**（0x02 洪泛会让 ack 匹配失败）——
+细节见 `jc_p4_app/docs/HANDOVER.md` 第廿五节 §3.2。
+
+## 6.1 吞吐基准工具
+
+```powershell
+python pc_host/_usb_bench.py --serial COM5                       # USB 四档（每档 3 次取中位）
+python pc_host/_usb_bench.py --tcp 127.0.0.1:13333 --tiers jpeg:20,raw:10
+```
 
 ## 7. 目录结构
 
