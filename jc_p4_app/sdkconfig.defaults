@@ -145,7 +145,18 @@ CONFIG_CACHE_L2_CACHE_LINE_128B=y
 
 # tinyusb CDC device class
 CONFIG_TINYUSB_CDC_ENABLED=y
+# USB HS 视频流（2026-10-16）：0x05 raw 是 614400B/帧 @10fps ≈ 6MB/s，CDC 的软件
+# FIFO 越大越能扛突发（写入要等主机排水）。⚠️ 但 FIFO 吃**内部 RAM**：
+# TX 512→8192 / RX 2048→4096 时实测**开机即崩**（assert failed:
+# esp_startup_start_app (res == pdTRUE) —— main 任务创建失败 → 重启循环）。
+# 本板内部 RAM 已贴边（见 HANDOVER 第廿三节与 BLE pre-sched heap 日志）：
+# 想放大必须先测出余量，或把 tinyusb 缓冲改到 PSRAM（改组件），别直接抄大数字。
+# 2026-10-16 实测：TX=4096(+3.5KB) **也崩**（assert failed: vApplicationGetIdleTaskMemory
+# port_common.c:53 (pxStackBufferTemp != NULL)）→ 本板内部 RAM 余量 **< 3.5KB**，
+# 只能维持 TX=512。要提速走「发送侧忙等 + 端点泵」而不是加 FIFO。
+# EP_BUFSIZE 保持 512（USB2.0 HS 批量端点最大包长，不能改）。
 CONFIG_TINYUSB_CDC_RX_BUFSIZE=2048
+CONFIG_TINYUSB_CDC_TX_BUFSIZE=512
 
 # WiFi/BLE restore (2026-10-02): esp_wifi_init + esp_hosted init chain overflows
 # the default 3584B main-task stack (Stack protection fault); esp-hosted recommends

@@ -28,6 +28,40 @@ esp_err_t app_usb_link_init(void);
 /* Send a frame to the PC (thread-safe). */
 esp_err_t app_usb_link_send(uint8_t type, const void *payload, uint32_t len);
 
+/* 两段式发送（2026-10-16，USB 视频流）：hdr 与 payload 分两次写入**同一帧**（同一 seq、
+   同一 CRC、同一 tx_lock）。用于 0x05 大帧——避免为了"8 字节头 + 614KB 数据"再分配
+   一整块 PSRAM 并 memcpy 一次（raw 10fps 时那是 6MB/s 的无谓拷贝）。 */
+esp_err_t app_usb_link_send2(uint8_t type,
+                             const void *hdr, uint32_t hdr_len,
+                             const void *payload, uint32_t payload_len);
+
+/* ---- 链路统计（供 link 命令/状态显示；只读快照）---- */
+typedef struct {
+    uint32_t tx_frames;   /* 成功发出的帧数 */
+    uint64_t tx_bytes;    /* 成功发出的总字节（含帧头与 CRC） */
+    uint32_t tx_drop;     /* 发送失败或超预算丢弃的帧数 */
+    uint32_t tx_last_ms;  /* 最近一帧发送耗时 ms */
+} app_usb_link_stats_t;
+
+void app_usb_link_get_stats(app_usb_link_stats_t *out);
+
+/* ---- 发送后端强制选择（2026-10-16 USB 视频流"自由切换"）----
+ * name = "usb" | "tcp" | "auto"（nullptr 等同 "auto"）；
+ *   auto（默认）：TCP 客户端连上则抢占为 tcp、断开回落内置 USB CDC —— 与历史行为一致；
+ *   usb  ：强制走 USB CDC（此时新来的 TCP 客户端会被 app_netlink 拒绝并说明原因）；
+ *   tcp  ：强制走 TCP（从 USB 侧发起的命令也回 TCP，便于"切到网口"）。
+ * 返回 false = 名字非法。 */
+bool app_usb_link_force_backend(const char *name);
+
+/* 当前**实际生效**的后端名（"usb-cdc" / "tcp"），用于结果帧 link 字段与 link 查询 */
+const char *app_usb_link_active_name(void);
+
+/* 强制态名（"auto" / "usb" / "tcp"） */
+const char *app_usb_link_forced_name(void);
+
+/* 是否处于"强制 usb"（app_netlink 用它决定要不要拒绝新 TCP 客户端） */
+bool app_usb_link_usb_forced(void);
+
 /* Send a log line (type 0x04, printf style, capped at 512 bytes). */
 void app_usb_link_log(const char *fmt, ...);
 

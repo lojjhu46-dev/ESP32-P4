@@ -26,6 +26,17 @@ _dev/
 jc_p4_app/_dev/
 _old_managed/
 
+# --- Qt 上位机（qt_host）：源码/脚本入库，构建产物与截图不入库 ---
+/qt_host/build/
+/qt_host/build-*/
+/qt_host/shots/
+
 # --- Windows 幽灵文件：`> nul` 被当文件名造出来的，git 无法索引
 #     （error: short read while indexing nul），会直接卡死 `git add .` ---
 /nul
+
+# --- 临时日志 / Python 缓存（2026-10-16）---
+/*.log
+/jc_p4_app/*.log
+__pycache__/
+*.pyc

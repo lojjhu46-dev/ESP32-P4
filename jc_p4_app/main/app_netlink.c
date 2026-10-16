@@ -105,6 +105,13 @@ static void netlink_serve(int fd, const char *peer_ip)
                      peer_ip, CONFIG_APP_NETLINK_PORT);
 
     while (1) {
+        /* 2026-10-16：被强制切到 usb 后主动断开本客户端——否则它会"连着却收不到任何东西"
+           （发送后端已改走 USB CDC）。收尾分支会 set_transport(NULL) 回落到 CDC。 */
+        if (app_usb_link_usb_forced()) {
+            ESP_LOGW(TAG, "link forced to usb -> dropping client %s", peer_ip);
+            app_usb_link_log("netlink: client %s dropped (link forced usb)", peer_ip);
+            break;
+        }
         int n = recv(fd, s_rx_buf, RX_CHUNK, 0);
         if (n > 0) {
             app_usb_link_feed(s_rx_buf, (uint32_t)n);
@@ -164,17 +171,39 @@ static void netlink_task(void *arg)
     }
     ESP_LOGI(TAG, "JCLINK over TCP listening on :%d (one client at a time)", port);
     app_status_set(APP_MOD_ETH, true, "tcp :%d", port);
+    ESP_LOGW(TAG, "netlink: entering accept loop (listen fd=%d)", s_listen);
 
+    uint32_t loop_n = 0;
     while (1) {
         struct sockaddr_in peer;
         socklen_t plen = sizeof(peer);
+        if (loop_n == 0) {
+            ESP_LOGW(TAG, "netlink: waiting for client (listen=%d)", s_listen);
+        }
         int fd = accept(s_listen, (struct sockaddr *)&peer, &plen);
         if (fd < 0) {
+            /* 诊断（2026-10-16）：accept 失败会静默空转——把 errno 打出来 */
+            if (loop_n < 4) {
+                ESP_LOGW(TAG, "accept failed errno=%d (listen=%d)", errno, s_listen);
+            }
+            loop_n++;
             vTaskDelay(pdMS_TO_TICKS(200));
             continue;
         }
+        ESP_LOGW(TAG, "netlink: accepted fd=%d (loop=%u)", fd, (unsigned)loop_n);
         char ip[16] = "?";
         inet_ntoa_r(peer.sin_addr, ip, sizeof(ip));
+
+        /* 2026-10-16：强制 usb 时拒绝新 TCP 客户端（否则"USB 侧发命令、TCP 客户端却
+           看不到应答"，容易被当成链路故障）。日志说明怎么恢复。 */
+        if (app_usb_link_usb_forced()) {
+            ESP_LOGW(TAG, "client %s rejected: link forced to usb", ip);
+            app_usb_link_log("netlink: client %s rejected (link forced usb; send "
+                             "{\"cmd\":\"link\",\"value\":\"auto\"} over USB to allow TCP)", ip);
+            close(fd);
+            continue;
+        }
+
         netlink_serve(fd, ip);
         vTaskDelay(pdMS_TO_TICKS(50));
     }

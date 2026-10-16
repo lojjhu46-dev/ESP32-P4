@@ -38,6 +38,7 @@ PC 端 LVGL SDL 模拟器 / 取景中枢显示与操作。
 |---|---|
 | `jc_p4_app/` | **固件工程**（ESP-IDF v5.5.5）：`main/` 应用源码、`docs/` 文档、`tools/` 脚本、`components/` |
 | `pc_host/` | PC 侧 Python 工具：`protocol.py`（JCLINK 库）、`board_hub.py`（取景中枢）、`jc_test.py`（CLI）、`thr_calib.py`（阈值标定）、各回归脚本 |
+| `qt_host/` | **C++/Qt6 全功能上位机**（TCP + USB 双通路）：实时视频 + 检测框、名单/阈值/相机/F10 备份面板、截图；构建与用法见其 `README.md`（Qt 6.12 mingw_64，`build.ps1` 一键构建） |
 | `docs/` | 硬件文档：`JC-ESP32P4-M3-DEV-开发要点.md`（引脚与硬件结论）、`项目框架构建指南.md` |
 | `esp_video/`、`esp_cam_sensor/` | 本地化 + patched 的 IDF 组件（`override_path` 依赖，**不可移动**） |
 | `lvgl_project/` | WSL LVGL 模拟器工程（只保留自研 `main/`、FreeRTOS 与配置） |
@@ -100,5 +101,6 @@ cmake -B build -S . && cmake --build build -j8
 | `jc_p4_app/docs/pc_link_references.md` | esp-dl / tinyusb / jpeg / lv_port 技术核实记录 |
 | `jc_p4_app/docs/esp-dl_issue_draft.md` | esp-dl 非确定性 issue 草稿（⏳ 待提交 Espressif） |
 | `jc_p4_app/README.md` | 固件工程导览（模块表 / 运行时命令 / 硬性纪律） |
+| `qt_host/README.md` | Qt 上位机：依赖/构建/连接方式/快捷键/无界面自检/**USB 实测数据** |
 | `docs/JC-ESP32P4-M3-DEV-开发要点.md` | 板卡硬件要点与引脚表（不依赖厂商资料包） |
 | `docs/项目框架构建指南.md` | 从零搭同类工程的步骤 |
