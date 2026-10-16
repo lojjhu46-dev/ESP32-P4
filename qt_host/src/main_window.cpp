@@ -174,6 +174,38 @@ void MainWindow::cmd(const QJsonObject &obj)
     m_link->sendCmd(obj);
 }
 
+void MainWindow::presetInterface(bool usb, const QString &serialPort, const QString &host,
+                                 quint16 port, bool autoConnect)
+{
+    m_ifaceBox->setCurrentIndex(usb ? 1 : 0);      /* 触发 updateIfaceWidgets */
+    if (usb) {
+        QString want = serialPort;
+        if (!want.isEmpty()) {
+            /* 允许只给 COMx：在列表里按端口号找（列表里存的是 data=COMx） */
+            const int idx = m_serialBox->findData(want, Qt::UserRole, Qt::MatchFixedString);
+            if (idx >= 0) {
+                m_serialBox->setCurrentIndex(idx);
+            } else {
+                refreshPorts();
+                const int idx2 = m_serialBox->findData(want);
+                if (idx2 >= 0) {
+                    m_serialBox->setCurrentIndex(idx2);
+                }
+            }
+        }
+    } else {
+        if (!host.isEmpty()) {
+            m_hostEdit->setText(host);
+        }
+        if (port) {
+            m_portSpin->setValue(port);
+        }
+    }
+    if (autoConnect) {
+        QTimer::singleShot(0, this, [this]() { onConnectClicked(); });
+    }
+}
+
 /* ---------------- 界面搭建 ---------------- */
 
 void MainWindow::buildUi()

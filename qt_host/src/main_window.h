@@ -30,6 +30,11 @@ class MainWindow : public QMainWindow
 public:
     explicit MainWindow(QWidget *parent = nullptr);
 
+    /* 命令行预置接口（2026-10-16）：qt_host.exe --serial COM5 / --tcp 192.168.33.2:3333
+     * 传 autoConnect=true 则启动后立即连（省去手点接口/端口/连接三步）。 */
+    void presetInterface(bool usb, const QString &serialPort, const QString &host,
+                         quint16 port, bool autoConnect);
+
 private:
     void buildUi();
     QWidget *buildStreamTab();

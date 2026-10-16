@@ -79,6 +79,29 @@ int main(int argc, char *argv[])
     }
 
     MainWindow w;
+
+    /* 命令行预置并自动连接（2026-10-16）：
+     *   qt_host.exe --serial COM5            走 USB（板子 High speed USB 口）
+     *   qt_host.exe --tcp 192.168.33.2:3333  走网口
+     * 不带参数 = 正常启动，手动选接口。 */
+    const QStringList args = app.arguments();
+    for (int i = 0; i < args.size(); i++) {
+        const QString a = args.at(i);
+        auto next = [&]() -> QString { return (i + 1 < args.size()) ? args.at(++i) : QString(); };
+        if (a == QLatin1String("--serial")) {
+            const QString p = next();
+            if (!p.isEmpty()) {
+                w.presetInterface(true, p, QString(), 0, true);
+            }
+        } else if (a == QLatin1String("--tcp")) {
+            const QString v = next();
+            if (!v.isEmpty()) {
+                w.presetInterface(false, QString(), v.section(QLatin1Char(':'), 0, 0),
+                                  quint16(v.section(QLatin1Char(':'), 1, 1).toUInt()), true);
+            }
+        }
+    }
+
     w.show();
     return app.exec();
 }
