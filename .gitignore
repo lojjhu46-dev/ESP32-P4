@@ -40,3 +40,9 @@ _old_managed/
 /jc_p4_app/*.log
 __pycache__/
 *.pyc
+
+# --- AI 助手 / 编辑器工作区文件（2026-10-17）---
+# 工具自身的缓存、会话与搜索规则：不属于项目源码，任何层级都不入库
+.codebuddy/
+.zcode/
+.zcodeignore
