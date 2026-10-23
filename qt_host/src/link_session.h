@@ -16,6 +16,8 @@
 #include "image_frame.h"
 #include "transport.h"
 
+class H264LivePlayer;
+
 class LinkSession : public QObject
 {
     Q_OBJECT
@@ -23,13 +25,14 @@ public:
     struct Stats {
         quint64 rxBytes = 0;
         quint64 txBytes = 0;
-        quint32 rxFrames = 0, rxImage = 0, rxResult = 0, rxLog = 0, rxBlock = 0;
+        quint32 rxFrames = 0, rxImage = 0, rxResult = 0, rxLog = 0, rxBlock = 0, rxH264 = 0;
         double  imgFps = 0.0;
         double  imgKbps = 0.0;
         quint32 imgDrop = 0;             /* 解码失败帧数 */
         /* 实际收到的图像格式/大小（2026-10-16）：板端 stream 的 fmt 可能与 UI 选择不一致
          * （例如"抓一帧 raw"把板端切到 raw 后没切回来），显示出来才能一眼看出。 */
         bool    lastRaw = false;
+        QString lastFmt = QStringLiteral("jpeg");   /* jpeg / raw / h264 */
         int     lastBytes = 0;
         QString link = QStringLiteral("-");   /* 板端结果帧里的 link 字段（usb-cdc / tcp） */
         QString lastLog;
@@ -89,6 +92,7 @@ private:
     void dbFinish(bool ok, const QString &msg);
 
     ITransport      *m_tp = nullptr;
+    H264LivePlayer  *m_h264 = nullptr;     /* 0x07 活流解码（随连接创建/销毁） */
     QString          m_iface;              /* "tcp" / "usb" */
     jcl::FrameParser m_parser;
     quint8           m_seq = 0;

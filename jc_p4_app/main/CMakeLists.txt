@@ -14,8 +14,14 @@ set(srcs
     "app_imgpipe.c"
     "app_stream.c"
     "app_camauto.c"
-    "app_faceai.cpp"
+    "app_h264enc.c"
 )
+
+# app_faceai.cpp 只能在 FACEAI 开启时编译：它直接引用 APP_FACEAI_* 系列
+# Kconfig 符号，而这些符号随 APP_ENABLE_FACEAI/IMG_PIPE 关闭会从 sdkconfig 消失。
+if(CONFIG_APP_ENABLE_FACEAI)
+    list(APPEND srcs "app_faceai.cpp")
+endif()
 
 set(requires
     nvs_flash

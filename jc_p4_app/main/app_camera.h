@@ -1,5 +1,6 @@
 #pragma once
 #include <stdbool.h>
+#include <stdint.h>
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -18,6 +19,16 @@ extern "C" {
  *    所以默认用 640x480@50fps。
  */
 esp_err_t app_camera_init(void);
+
+/*
+ * 帧旁路回调：在 camera_task 内、帧缓冲归还驱动之前**同步**调用。
+ * 回调返回后该 mmap 缓冲立刻 QBUF，因此回调内必须完成对帧的消费
+ * （H.264 硬编即零拷贝把该指针当 USERPTR 喂给 /dev/video11）。
+ * 必须在 app_camera_init() 之前注册，否则首帧会漏掉。
+ */
+typedef void (*app_camera_frame_cb_t)(const uint8_t *data, int w, int h,
+                                      int stride, uint32_t fourcc);
+void app_camera_set_frame_cb(app_camera_frame_cb_t cb);
 
 /* 摄像头是否已出流（imgpipe 用它决定默认图像源） */
 bool app_camera_ready(void);

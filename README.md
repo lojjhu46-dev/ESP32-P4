@@ -7,6 +7,9 @@ PC 端 LVGL SDL 模拟器 / 取景中枢显示与操作。
 
 > **接手/继续开发请先读** [`jc_p4_app/docs/HANDOVER.md`](jc_p4_app/docs/HANDOVER.md)：
 > 全部技术结论、踩坑、验收数据、目录约定都在那里；本 README 只做导览与**依赖获取说明**。
+>
+> 🔴 **本工作区是 H.264 重构的起点**：方向、框架规划、阶段计划（M0~M4）、预算表、风险登记册、
+> 重构护栏、开工 checklist 全在 [`docs/H264重构交接与阶段计划.md`](docs/H264重构交接与阶段计划.md)。**先读它再动手。**
 
 ---
 
@@ -95,6 +98,7 @@ cmake -B build -S . && cmake --build build -j8
 
 | 文档 | 内容 |
 |---|---|
+| `docs/H264重构交接与阶段计划.md` | 🔴 **本阶段开工文档**：H.264 方向决策 / 已核实事实（文件:行号）/ 分层与协议 0x07 设计 / M0~M4 与验收阈值 / PSRAM 预算 / 风险登记 / 重构护栏 / checklist |
 | `jc_p4_app/docs/HANDOVER.md` | ★ 主文档：技术结论 / 踩坑 / 验收记录 / **目录约定（第 6 节）** |
 | `jc_p4_app/docs/face_recog_day_plan.md` | 人脸识别功能规划（P0~P3 + 三轮实施）与进度 |
 | `jc_p4_app/docs/usb_link_protocol.md` | JCLINK 协议规范（两端共用） |

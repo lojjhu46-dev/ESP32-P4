@@ -22,10 +22,11 @@ T_CMD = 0x03
 T_LOG = 0x04
 T_IMAGE = 0x05          # board -> PC 图像帧（见 jc_p4_app/main/app_stream.h）
 T_BLOCK = 0x06          # 双向：块数据分片 offset(u32 LE)+data（F10 特征库备份/恢复）
+T_H264 = 0x07           # board -> PC H.264 访问单元（见 jc_p4_app/main/app_h264enc.c）
 
 MAX_PAYLOAD = 1024 * 1024   # 与板端 JCL_MAX_PAYLOAD 保持一致（0x05 raw 帧 614KB）
 TYPE_NAME = {T_JPEG: "JPEG", T_RESULT: "RESULT", T_CMD: "CMD", T_LOG: "LOG",
-             T_IMAGE: "IMAGE", T_BLOCK: "BLOCK"}
+             T_IMAGE: "IMAGE", T_BLOCK: "BLOCK", T_H264: "H264"}
 
 # 0x05 载荷头（小端）：fmt u8 | flags u8 | width u16 | height u16 | seq u16
 IMG_HDR_LEN = 8
@@ -56,6 +57,38 @@ class ImageFrame:
     def __repr__(self) -> str:
         kind = "jpeg" if self.is_jpeg else "rgb565"
         return f"<ImageFrame {self.width}x{self.height} {kind} seq={self.seq} {len(self.data)}B>"
+
+
+# 0x07 载荷头（小端）：codec u8 | flags u8 | stream_id u16 | pts_us u32 |
+#                     frame_seq u32 | width u16 | height u16 | nal_len u32
+H264_HDR_LEN = 20
+H264_FLAG_KEYFRAME = 0x01
+H264_FLAG_SPS_PPS = 0x02
+H264_FLAG_LAST_FRAG = 0x04
+
+
+class H264Frame:
+    """0x07 H.264 访问单元（板端 app_h264enc 发出）"""
+
+    __slots__ = ("codec", "flags", "stream_id", "pts_us", "frame_seq",
+                 "width", "height", "nal_len", "data")
+
+    def __init__(self, payload: bytes):
+        if len(payload) < H264_HDR_LEN:
+            raise ValueError(f"h264 payload too short: {len(payload)}")
+        (self.codec, self.flags, self.stream_id, self.pts_us, self.frame_seq,
+         self.width, self.height, self.nal_len) = struct.unpack("<BBHIIHHI", payload[:H264_HDR_LEN])
+        if H264_HDR_LEN + self.nal_len > len(payload):
+            raise ValueError(f"h264 nal_len {self.nal_len} > payload {len(payload)}")
+        self.data = payload[H264_HDR_LEN:H264_HDR_LEN + self.nal_len]
+
+    @property
+    def is_keyframe(self) -> bool:
+        return bool(self.flags & H264_FLAG_KEYFRAME)
+
+    def __repr__(self) -> str:
+        return (f"<H264Frame stream={self.stream_id} {self.width}x{self.height} "
+                f"seq={self.frame_seq} key={self.is_keyframe} {len(self.data)}B>")
 
 
 def crc16_ccitt(data: bytes, crc: int = 0xFFFF) -> int:
@@ -118,6 +151,9 @@ class Link:
         self.parser = FrameParser()
         self.seq = 0
         self.logs: list[str] = []
+        # 同一批 read 里可能同时包含 ack 和紧随其后的 0x06 分片；recv() 命中 ack
+        # 就返回，会把同批剩余帧丢掉（F10 备份实测稳定丢第 1 个 16KB 分片）。
+        self._pending: list = []
         self.tcp = None
         self.ser = None
         if tcp:
@@ -130,6 +166,11 @@ class Link:
             import serial  # pyserial
 
             self.ser = serial.Serial(serial_port, 115200, timeout=0.05)
+            # H.264 0x07 峰值 ~200KB/s；默认 4KB RX 缓冲 + 逐帧写盘会丢参考帧。
+            try:
+                self.ser.set_buffer_size(rx_size=256 * 1024, tx_size=64 * 1024)
+            except Exception:
+                pass
             self.desc = f"serial {serial_port}"
         else:
             raise ValueError("need tcp= or serial_port=")
@@ -140,7 +181,7 @@ class Link:
             if self.tcp:
                 return self.tcp.recv(65536)   # 图像帧可达数十 KB，尽量一次多读
             n = self.ser.in_waiting or 1
-            return self.ser.read(min(max(n, 1), 4096))
+            return self.ser.read(min(max(n, 1), 65536))
         except (socket.timeout, TimeoutError, OSError):
             return b""
 
@@ -167,18 +208,31 @@ class Link:
 
     def recv(self, timeout: float | None = None, want=(T_RESULT, T_LOG)):
         """收帧；(type, seq, payload) 或 None(超时)。0x04 日志会被收集到 self.logs 并打印"""
+        for i, frame in enumerate(self._pending):
+            if frame[0] in want:
+                return self._pending.pop(i)
         deadline = time.monotonic() + (self.timeout if timeout is None else timeout)
         while time.monotonic() < deadline:
             data = self._read()
             if data:
-                for frame in self.parser.feed(data):
-                    ptype, _seq, payload = frame
+                frames = self.parser.feed(data)
+                for ptype, _seq, payload in frames:
                     if ptype == T_LOG:
                         line = payload.decode("utf-8", "replace").rstrip("\n")
                         self.logs.append(line)
                         print(f"  [board] {line}")
-                    if ptype in want:
-                        return ptype, _seq, payload
+                for i, frame in enumerate(frames):
+                    # 同一批 read 里 ack 后面常紧跟 0x06 分片；提前 return 会丢掉
+                    # 剩余已解析帧（F10 备份实测稳定丢中间 16KB 块）→ 先入队。
+                    if frame[0] in (T_RESULT, T_BLOCK):
+                        if frame[0] in want:
+                            self._pending.extend(
+                                f for f in frames[i + 1:] if f[0] in (T_RESULT, T_BLOCK))
+                            return frame
+                        # 只缓存小帧；图像/H.264 帧丢弃，避免排队吃内存
+                        self._pending.append(frame)
+                        if len(self._pending) > 32:
+                            self._pending.pop(0)
             else:
                 time.sleep(0.005)
         return None
@@ -193,6 +247,13 @@ class Link:
         if frame is None:
             return None
         return ImageFrame(frame[2])
+
+    def recv_h264(self, timeout: float | None = None) -> H264Frame | None:
+        """等一条 0x07 H.264 访问单元（板端 M0 自动发送）"""
+        frame = self.recv(timeout=timeout, want=(T_H264,))
+        if frame is None:
+            return None
+        return H264Frame(frame[2])
 
     def recv_block(self, timeout: float | None = None):
         """等一个 0x06 块分片，返回 (offset, data) 或 None（F10 备份导出用）"""

@@ -1,7 +1,7 @@
 # qt_host —— JCLINK 上位机（C++/Qt6）
 
 ESP32-P4 边缘人脸识别终端的 PC 上位机：**同时支持网口（TCP）与高速 USB（CDC 串口）**，
-接收 0x05 视频流并显示，叠加 0x02 检测结果，内置全功能控制面板（流/名单/识别/相机/备份）。
+接收 0x05（JPEG/raw）或 **0x07（H.264）**视频流并显示，叠加 0x02 检测结果，内置全功能控制面板（流/名单/识别/相机/备份）。
 
 > **新会话接手先读**：[`../jc_p4_app/docs/HANDOVER.md`](../jc_p4_app/docs/HANDOVER.md) 第廿五节
 > （USB 视频流 + Qt 上位机的实测数据与坑）。
@@ -10,7 +10,8 @@ ESP32-P4 边缘人脸识别终端的 PC 上位机：**同时支持网口（TCP�
 
 | 项 | 路径 | 说明 |
 |---|---|---|
-| Qt | `D:\qt\qt\Qt\6.12.0\mingw_64` | **6.12.0 mingw_64**（含 Core/Gui/Widgets/Network） |
+| Qt | `D:\qt\qt\Qt\6.12.0\mingw_64` | **6.12.0 mingw_64**（Core/Gui/Widgets/Network） |
+| FFmpeg | `D:\ffmpeg\bin\ffmpeg.exe` | 0x07 H.264 解码（子进程输出 raw RGB） |
 | MinGW | `D:\qt\qt\Qt\Tools\mingw1310_64` | 13.1.0（qt_host 用它的 g++ 编译） |
 | Ninja | `D:\qt\qt\Qt\Tools\Ninja` | 构建器 |
 | CMake | `C:\Program Files\CMake\bin\cmake.exe` | ≥3.21 |
@@ -18,6 +19,27 @@ ESP32-P4 边缘人脸识别终端的 PC 上位机：**同时支持网口（TCP�
 ⚠️ **本机 Qt 未安装 `Qt6SerialPort` 模块** → 串口用 **Win32 API 自实现**
 （`src/serial_transport.cpp`：`CreateFile` + `SetupComm(1MB)` + `SetCommTimeouts` + 独立读线程），
 不依赖该模块、也不需要联网装组件。
+
+## 1b. 0x07 H.264 实时流（2026-10-23 打通）
+
+- 板端 `app_h264enc` 发 0x07：20B 头（`codec/flags/stream_id/pts_us/frame_seq/w/h/nal_len`）
+  + Annex-B 访问单元；SPS/PPS 随每个 IDR 携带，所以中途加入也能起播。
+- 解码用 **ffmpeg.exe 子进程**（`H264LivePlayer`）：NAL 写 stdin，
+  `ffmpeg -f h264 -i pipe:0 -f rawvideo -pix_fmt rgb24 pipe:1` 输出裸 RGB，
+  Qt 按 `w*h*3` 切帧成 `QImage` 后复用现有 `video_view`。
+- ⚠️ 不要用 `QMediaPlayer` 直接喂活管道：它的 FFmpeg 后端会把非 seekable 源卡在
+  Buffering，约 1 秒后报 `Demuxing failed -1` 并冻结（实测）。
+- ffmpeg 路径：优先环境变量 `FFMPEG_EXE`，其次 `PATH`，最后 `D:/ffmpeg/bin/ffmpeg.exe`。
+- 控制台诊断日志：`[h264] ffmpeg decoder started` / `[h264] ffmpeg exited`。
+- ⚠️ 板端默认**开机自动单档推流**（M2：1Mbps/QP30-38/GOP25），Qt 连接后即可看到画面；
+  顶栏的“开始/停止流”按钮已删除。
+- 运行时命令（FACEAI 关闭时板端注册的最小 handler）：
+  `{"cmd":"stream","value":"on|off","bitrate":N,"qp_min":N,"qp_max":N,"i_period":N}`，
+  回 `{"ack":"stream","value":bool,"fmt":"h264","bitrate":...,"qp_min":...,"qp_max":...,"i_period":...}`；
+  参数变化会在下一帧重建编码器（短暂停顿）。
+- **UI**：「流」页 `H.264 编码` 一组控件（码率 25-2500 kbps / QP 上下限 / I 帧间隔）+
+  `下发编码参数` 按钮。只发参数、不发 `value`，所以不会改变流的开关；
+  `qp_min >= qp_max` 本地拦截（相等会关闭码控）。连接时的 `stream` 查询会把当前值回填。
 
 ## 2. 构建与运行
 
@@ -44,16 +66,17 @@ powershell -ExecutionPolicy Bypass -File qt_host\build.ps1 -Run     # 构建后�
 ## 4. 界面与操作
 
 - **顶栏**：接口选择 / 地址或 COM 口 / 连接断开 / **链路徽标**（`usb-cdc` 或 `tcp`，来自结果帧 `link` 字段）/
-  板端 link 强制态（auto·usb·tcp）/ 开始-停止流 / 截图 / 缩放
+  板端 link 强制态（auto·usb·tcp）/ 截图 / 缩放
 - **左侧**：视频区（黑底等比 letterbox，叠加命中绿框+名字+相似度、未知黄框、关键点红点，
   右上角角标实时显示 `fps / KB-s / 丢帧 / 链路`）+ 板端日志区
 - **右侧 Tab**：
-  - **流**：fps(1-30)、quality(1-100)、格式 JPEG/raw、图像源 cam/pc、raw 字节序交换
+  - **流**：fps(1-30)、quality(1-100)、格式 JPEG/raw、图像源 cam/pc、raw 字节序交换；
+    H.264 编码参数（码率/QP 上下限/I 帧间隔，仅 YUV420 固件）
   - **名单**：表格（名字/特征数）、Register（1/3/5 帧）、Delete、Clear（二次确认）
   - **识别**：detect/match、thr_lo、thr_hi、fast_thr、dedup_ms、multi
   - **相机**：gain/exp 滑块、帧率档、镜像、AE、AWB、夜视、低光照停人脸、降噪档
   - **备份**：F10 特征库导出 `.bin` / 导入（覆盖式，板端自动 `.bak`）+ 进度条
-- **快捷键**：`S` 截图 · `空格` 开始/停止流 · `R` 重连
+- **快捷键**：`S` 截图 · `R` 重连
 - 截图存到 **exe 同目录的 `shots/`**（PNG，含检测框叠加层，按原始分辨率出图）
 
 连接成功后会自动发一轮状态查询（`mode`/`cam`/`stream`/`link`/`list`）把控件同步成板端真实值。

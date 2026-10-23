@@ -600,4 +600,132 @@ menu "JC P4 App Configuration"
         bool "Enable MIPI-CSI camera (esp_video, SC2336)"
         default y
 
+    choice APP_CAM_OUT_FMT
+        prompt "Camera output pixel format"
+        default APP_CAM_OUT_FMT_RGB565
+        depends on APP_ENABLE_CAMERA
+        help
+            ISP 同一时刻只能输出一种格式。RGB565 是既有链路（imgpipe/AI/JPEG 预览）；
+            YUV420 是 H.264 硬编通路（摄像头 -> /dev/video11）。选 YUV420 时必须
+            关闭 IMG_PIPE/STREAM/FACEAI，否则下游会按 RGB565 误读。
+
+        config APP_CAM_OUT_FMT_RGB565
+            bool "RGB565 (imgpipe / AI / JPEG preview)"
+
+        config APP_CAM_OUT_FMT_YUV420
+            bool "YUV420 (hardware H.264 encoder feed)"
+    endchoice
+
+    config APP_H264_DUMP_SECONDS
+        int "M0: seconds per bitrate/QP phase"
+        default 8
+        range 2 60
+        depends on APP_CAM_OUT_FMT_YUV420
+        help
+            M0 参数扫描每个阶段录制的时长。
+
+    config APP_H264_FEED_FPS
+        int "M0: max frames fed to hardware encoder per second"
+        default 25
+        range 1 50
+        depends on APP_CAM_OUT_FMT_YUV420
+        help
+            相机按 50fps 出帧，编码只取其中一部分；M0 默认 25fps。
+
+    config APP_H264_GOP
+        int "M0: I-period / GOP (also used as encoder fps)"
+        default 25
+        range 1 120
+        depends on APP_CAM_OUT_FMT_YUV420
+        help
+            ⚠️ esp_video 的 H.264 设备把 I_PERIOD 同时当 fps 传给编码器。
+            默认与 APP_H264_FEED_FPS=25 对齐；两者不一致会让码控按错误帧率分配码率。
+
+    config APP_H264_EXP_LINES
+        int "M0: fixed exposure in sensor lines (AE is off in M0)"
+        default 519
+        range 8 994
+        depends on APP_CAM_OUT_FMT_YUV420
+        help
+            M0 关闭 FACEAI 后 app 级 AE 不运行，sensor 默认曝光是满帧 994 行，
+            室内会过曝成纯白（实测 YAVG≈253），三档码率全部失真。
+            519 行是 HANDOVER 实测定值的白天档（gain72/exp519 → avg_luma≈120）。
+            曝光单位是**行**，不是 100µs；640x480@50fps 上限 994 行≈19.9ms。
+
+    config APP_H264_SINK_LINK
+        bool "M0: send NAL over JCLINK 0x07 (USB CDC / TCP)"
+        default y
+        depends on APP_CAM_OUT_FMT_YUV420
+        help
+            把每个编码访问单元作为 0x07 帧发给上位机（pc_host/h264_capture.py）。
+            发送在独立的低优先级任务里做，camera 回调只做编码 + 入队。
+
+    config APP_H264_SINK_SD
+        bool "M0: also write NAL to /sdcard"
+        default n
+        depends on APP_CAM_OUT_FMT_YUV420
+        help
+            有 TF 卡时额外落盘。写卡同样在发送任务里执行，不在 camera 回调内。
+
+    config APP_H264_LOOP
+        bool "M0: loop the bitrate/QP sweep (live preview)"
+        default n
+        depends on APP_CAM_OUT_FMT_YUV420
+        help
+            循环跑三档，便于上位机长时间观察流畅度/清晰度。测量阶段请关掉。
+
+    config APP_H264_SWEEP
+        bool "M0: run the 3-phase bitrate/QP sweep"
+        default n
+        depends on APP_CAM_OUT_FMT_YUV420
+        help
+            关闭时只跑单档稳定流（M2/Qt 上位机默认），开机自动推流。
+            需要取码率对照表时再打开。
+
+    config APP_H264_LIVE_BITRATE
+        int "Live H.264 bitrate (bps)"
+        default 1000000
+        range 25000 2500000
+        depends on APP_CAM_OUT_FMT_YUV420 && !APP_H264_SWEEP
+        help
+            M2 默认 1Mbps ≈ 125KB/s，低于 USB/TCP 实测天花板（~292KB/s JPEG 路径）。
+
+    config APP_H264_LIVE_QP_MIN
+        int "Live H.264 min QP"
+        default 30
+        range 0 51
+        depends on APP_CAM_OUT_FMT_YUV420 && !APP_H264_SWEEP
+        help
+            实测 25 时 QP 下限压不住码率（~175KB/s）；30-38 在 640x480 室内
+            逆光场景约 120KB/s，满足 M2 的 ≤140KB/s。
+
+    config APP_H264_LIVE_QP_MAX
+        int "Live H.264 max QP"
+        default 38
+        range 0 51
+        depends on APP_CAM_OUT_FMT_YUV420 && !APP_H264_SWEEP
+        help
+            必须 > QP_MIN，否则码率控制被静默关闭。
+
+    config APP_H264_LIVE_GOP
+        int "Live H.264 GOP / I-period (also encoder fps)"
+        default 25
+        range 1 120
+        depends on APP_CAM_OUT_FMT_YUV420 && !APP_H264_SWEEP
+
+    config APP_H264_WB_KR
+        int "M0 fixed ISP WB red gain (permille, 1000 = neutral)"
+        default 1000
+        range 500 3000
+        depends on APP_CAM_OUT_FMT_YUV420
+        help
+            M0 关闭 FACEAI 后 AWB 闭环不运行；CONFIG_APP_CAM_WB_KR/KB 是给 AWB
+            用的偏置（实测 1320/1645 在无 AWB 时会整体偏粉紫）。M0 用固定中性值。
+
+    config APP_H264_WB_KB
+        int "M0 fixed ISP WB blue gain (permille, 1000 = neutral)"
+        default 1000
+        range 500 3000
+        depends on APP_CAM_OUT_FMT_YUV420
+
 endmenu

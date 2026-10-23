@@ -12,6 +12,10 @@ extern "C" {
 #define JCL_TYPE_CMD     0x03   /* PC -> board, JSON command */
 #define JCL_TYPE_LOG     0x04   /* board -> PC, log line */
 #define JCL_TYPE_IMAGE   0x05   /* board -> PC, image frame (see app_stream.h) */
+#define JCL_TYPE_H264    0x07   /* board -> PC, H.264 access unit (see app_h264enc.c)
+                                 * payload = 20B 头 + Annex-B NAL，小端：
+                                 * codec u8 | flags u8 | stream_id u16 | pts_us u32 |
+                                 * frame_seq u32 | width u16 | height u16 | nal_len u32 */
 #define JCL_TYPE_BLOB    0x06   /* both ways, bulk blob chunk (F10 db backup):
                                  * payload = offset(u32 LE) + data，板端按偏移重组 */
 #define JCL_BLOB_CHUNK_DEF  (16 * 1024)  /* 0x06 默认分片（不含 4B 偏移头） */

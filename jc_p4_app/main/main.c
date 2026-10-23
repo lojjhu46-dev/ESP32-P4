@@ -24,6 +24,7 @@
 #include "app_imgpipe.h"
 #include "app_stream.h"
 #include "app_faceai.h"
+#include "app_h264enc.h"
 #include "sdkconfig.h"
 
 static const char *TAG = "main";
@@ -128,6 +129,14 @@ void app_main(void)
 #endif
 
 #if CONFIG_APP_ENABLE_CAMERA
+    /* 帧回调必须在 app_camera_init() 之前注册：相机任务一起来就会出帧 */
+#if CONFIG_APP_CAM_OUT_FMT_YUV420
+    app_h264enc_register();
+#if !CONFIG_APP_ENABLE_FACEAI
+    /* FACEAI 关闭时它不注册命令回调，这里接管最小 stream 命令 */
+    app_usb_link_set_cmd_cb(app_h264enc_cmd_cb);
+#endif
+#endif
     app_camera_init();
 #else
     app_status_set(APP_MOD_CAM, true, "disabled");

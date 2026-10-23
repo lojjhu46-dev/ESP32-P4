@@ -14,7 +14,7 @@ dependencies:
     - name: idf
       version: '>=5.0'
     source:
-      path: D:\esp32project\ESP32-P4\esp-dl\tools\dl_fft
+      path: D:\esp32project\H.264-esp32-p4\esp-dl\tools\dl_fft
       type: local
     version: 0.6.0
   espressif/eppp_link:
@@ -46,7 +46,7 @@ dependencies:
     - name: espressif/dl_fft
       version: '>=0.6.0'
     source:
-      path: D:\esp32project\ESP32-P4\esp-dl\esp-dl
+      path: D:\esp32project\H.264-esp32-p4\esp-dl\esp-dl
       type: local
     targets:
     - esp32
@@ -68,7 +68,7 @@ dependencies:
     - name: idf
       version: '>=5.3'
     source:
-      path: D:\esp32project\ESP32-P4\esp_cam_sensor
+      path: D:\esp32project\H.264-esp32-p4\esp_cam_sensor
       type: local
     targets:
     - esp32p4
@@ -160,7 +160,7 @@ dependencies:
   espressif/esp_new_jpeg:
     dependencies: []
     source:
-      path: D:\esp32project\ESP32-P4\esp-adf-libs\esp_new_jpeg
+      path: D:\esp32project\H.264-esp32-p4\esp-adf-libs\esp_new_jpeg
       type: local
     targets:
     - esp32
@@ -176,7 +176,7 @@ dependencies:
     - esp32h4
     version: 1.0.2
   espressif/esp_sccb_intf:
-    component_hash: eb6a7d5c992f09583c163b2e3f5e95a0fdc87a2d9f8e026f3e59153935553889
+    component_hash: fcf118cd29a1caaf3b09bacd99975bc035c996b470474dfb950202c16e06d7b5
     dependencies:
     - name: idf
       require: private
@@ -184,7 +184,7 @@ dependencies:
     source:
       registry_url: https://components.espressif.com/
       type: service
-    version: 0.0.9
+    version: 1.0.0
   espressif/esp_serial_slave_link:
     component_hash: ac1776806de0a6e371c84e87898bb983e19ce62aa7f1e2e5c4a3b0234a575d2c
     dependencies:
@@ -196,7 +196,7 @@ dependencies:
       type: service
     version: 1.1.2
   espressif/esp_tinyusb:
-    component_hash: 0fab24246e07bdf919c6489d17a590cffbffbbf6a9c44d6235641645c8b946b7
+    component_hash: cfb066b239957ebfba5f7a7764e534b3000d3b400fd42d11bedb6ee5e6eaf3c9
     dependencies:
     - name: idf
       require: private
@@ -214,7 +214,7 @@ dependencies:
     - esp32p4
     - esp32h4
     - esp32s31
-    version: 2.3.0
+    version: 2.4.0
   espressif/esp_video:
     dependencies:
     - name: espressif/cmake_utilities
@@ -228,7 +228,7 @@ dependencies:
     - name: idf
       version: '>=5.4'
     source:
-      path: D:\esp32project\ESP32-P4\esp_video
+      path: D:\esp32project\H.264-esp32-p4\esp_video
       type: local
     targets:
     - esp32p4
@@ -259,7 +259,7 @@ dependencies:
       override_path: ../../esp-dl
       version: ~3.3.0
     source:
-      path: D:\esp32project\ESP32-P4\esp-dl\models\human_face_detect
+      path: D:\esp32project\H.264-esp32-p4\esp-dl\models\human_face_detect
       type: local
     version: 0.5.0
   espressif/human_face_recognition:
@@ -268,7 +268,7 @@ dependencies:
       override_path: ../human_face_detect
       version: ~0.5.0
     source:
-      path: D:\esp32project\ESP32-P4\esp-dl\models\human_face_recognition
+      path: D:\esp32project\H.264-esp32-p4\esp-dl\models\human_face_recognition
       type: local
     version: 0.3.2
   espressif/tinyusb:
@@ -314,7 +314,7 @@ dependencies:
       - if: idf_version >=5.5 && $CONFIG{LV_USE_LZ4} == True && $CONFIG{LV_USE_LZ4_INTERNAL} == False
       version: ^1.10.0
     source:
-      path: D:\esp32project\ESP32-P4\lvgl
+      path: D:\esp32project\H.264-esp32-p4\lvgl
       type: local
     version: '*'
 direct_dependencies:

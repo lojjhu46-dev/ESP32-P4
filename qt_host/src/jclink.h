@@ -20,6 +20,7 @@ constexpr quint8 T_CMD    = 0x03;
 constexpr quint8 T_LOG    = 0x04;
 constexpr quint8 T_IMAGE  = 0x05;
 constexpr quint8 T_BLOCK  = 0x06;
+constexpr quint8 T_H264   = 0x07;   /* 板端 app_h264enc：20B 头 + Annex-B NAL */
 
 constexpr quint32 MAX_PAYLOAD = 1024u * 1024u;   /* 与板端 JCL_MAX_PAYLOAD 一致 */
 

@@ -130,13 +130,13 @@ MainWindow::MainWindow(QWidget *parent)
         m_sbTraffic->setText(QStringLiteral("RX %1 KB · TX %2 KB")
                                  .arg(st.rxBytes / 1024).arg(st.txBytes / 1024));
         m_sbFps->setText(QStringLiteral("%1 %2 fps · %3 KB/s")
-                             .arg(st.lastRaw ? QStringLiteral("raw") : QStringLiteral("jpeg"))
+                             .arg(st.lastFmt)
                              .arg(st.imgFps, 0, 'f', 1)
                              .arg(st.imgKbps, 0, 'f', 0));
         m_sbDrop->setText(QStringLiteral("丢帧 %1").arg(st.imgDrop));
         /* 角标带上实际格式：一眼看出"UI 选 JPEG 但板子在推 raw"这类不一致 */
         m_view->setStatsText(QStringLiteral("%1 %2 fps  %3 KB/s  丢%4  %5")
-                                 .arg(st.lastRaw ? QStringLiteral("raw") : QStringLiteral("jpeg"),
+                                 .arg(st.lastFmt,
                                       QString::number(st.imgFps, 'f', 1),
                                       QString::number(st.imgKbps, 'f', 0))
                                  .arg(st.imgDrop)
@@ -265,8 +265,6 @@ void MainWindow::buildUi()
     m_linkModeBox->setFixedWidth(78);
     m_linkModeBox->setToolTip(QStringLiteral("板端 link 强制态：auto=TCP 连上抢占 / usb=强制 USB / tcp=强制网口"));
 
-    m_streamBtn = button(QStringLiteral("开始流"), QStringLiteral("primary"));
-    m_streamBtn->setFixedWidth(90);
     m_shotBtn = button(QStringLiteral("截图 (S)"));
     m_zoomBox = new QComboBox;
     m_zoomBox->addItems({QStringLiteral("适应窗口"), QStringLiteral("1x"), QStringLiteral("2x"), QStringLiteral("3x")});
@@ -284,7 +282,6 @@ void MainWindow::buildUi()
     topL->addWidget(new QLabel(QStringLiteral("链路")));
     topL->addWidget(m_linkModeBox);
     topL->addStretch(1);
-    topL->addWidget(m_streamBtn);
     topL->addWidget(m_shotBtn);
     topL->addWidget(new QLabel(QStringLiteral("缩放")));
     topL->addWidget(m_zoomBox);
@@ -353,36 +350,11 @@ void MainWindow::buildUi()
         if (m_syncing || !m_link->isConnected()) return;
         cmd(cmdObj(QStringLiteral("link"), QStringLiteral("value"), m_linkModeBox->currentText()));
     });
-    connect(m_streamBtn, &QPushButton::clicked, this, [this]() {
-        if (!m_link->isConnected()) { statusError(QStringLiteral("请先连接")); return; }
-        const bool want = !m_streamOn;
-        QJsonObject o = cmdObj(QStringLiteral("stream"), QStringLiteral("value"),
-                               want ? QStringLiteral("on") : QStringLiteral("off"));
-        if (want) {
-            /* ⚠️ 必须带 fmt/fps/quality：板端的 fmt 可能停在 raw（例如刚用过"抓一帧 raw"），
-               只发 stream on 会继续推 raw 614KB/帧 ≈2.3fps，看起来就是"预览只有两三帧"。
-               2026-10-16 实测踩到：UI 显示 JPEG、实际在推 raw。 */
-            o.insert(QStringLiteral("fps"), m_fpsSpin->value());
-            o.insert(QStringLiteral("quality"), m_qSpin->value());
-            o.insert(QStringLiteral("fmt"), m_fmtBox->currentData().toString());
-        }
-        cmd(o);
-        appendLog(QStringLiteral("→ %1（%2 %3fps q%4）")
-                      .arg(want ? QStringLiteral("开始流") : QStringLiteral("停止流"),
-                           m_fmtBox->currentData().toString())
-                      .arg(m_fpsSpin->value())
-                      .arg(m_qSpin->value()));
-    });
-
     /* 快捷键 */
     auto *s = new QAction(this);
     s->setShortcut(QKeySequence(QStringLiteral("S")));
     connect(s, &QAction::triggered, this, &MainWindow::saveScreenshot);
     addAction(s);
-    auto *sp = new QAction(this);
-    sp->setShortcut(QKeySequence(Qt::Key_Space));
-    connect(sp, &QAction::triggered, this, [this]() { m_streamBtn->click(); });
-    addAction(sp);
     auto *r = new QAction(this);
     r->setShortcut(QKeySequence(QStringLiteral("R")));
     connect(r, &QAction::triggered, this, [this]() {
@@ -434,14 +406,53 @@ QWidget *MainWindow::buildStreamTab()
     m_srcBox->addItem(QStringLiteral("PC 送帧 (pc)"), QStringLiteral("pc"));
     m_swapChk = new QCheckBox(QStringLiteral("raw 显示前交换字节序（颜色不对时勾选）"));
 
+    /* H.264 编码参数：板端 esp_video 的 4 个控件只在 STREAMON 生效，
+       参数变化会在下一帧重建编码器（画面短暂停顿）。 */
+    m_brSpin = new QSpinBox;
+    m_brSpin->setRange(25, 2500);
+    m_brSpin->setSingleStep(25);
+    m_brSpin->setValue(1000);
+    m_brSpin->setSuffix(QStringLiteral(" kbps"));
+    m_brSpin->setFixedWidth(112);
+
+    m_qpMinSpin = new QSpinBox;
+    m_qpMinSpin->setRange(0, 51);
+    m_qpMinSpin->setValue(30);
+    m_qpMinSpin->setFixedWidth(56);
+    m_qpMaxSpin = new QSpinBox;
+    m_qpMaxSpin->setRange(0, 51);
+    m_qpMaxSpin->setValue(38);
+    m_qpMaxSpin->setFixedWidth(56);
+
+    m_iPeriodSpin = new QSpinBox;
+    m_iPeriodSpin->setRange(1, 120);
+    m_iPeriodSpin->setValue(25);
+    m_iPeriodSpin->setFixedWidth(64);
+
+    auto *qpRow = new QWidget;
+    auto *qph = new QHBoxLayout(qpRow);
+    qph->setContentsMargins(0, 0, 0, 0);
+    qph->setSpacing(6);
+    qph->addWidget(m_qpMinSpin);
+    qph->addWidget(dimLabel(QStringLiteral("至")));
+    qph->addWidget(m_qpMaxSpin);
+    qph->addStretch(1);
+
     v->addWidget(formRow(QStringLiteral("帧率"), fpsRow));
     v->addWidget(formRow(QStringLiteral("质量"), qRow));
     v->addWidget(formRow(QStringLiteral("格式"), m_fmtBox));
     v->addWidget(formRow(QStringLiteral("图像源"), m_srcBox));
     v->addWidget(m_swapChk);
 
+    v->addWidget(dimLabel(QStringLiteral("— H.264 编码（仅 YUV420 固件）—")));
+    v->addWidget(formRow(QStringLiteral("码率"), m_brSpin));
+    v->addWidget(formRow(QStringLiteral("QP 范围"), qpRow));
+    v->addWidget(formRow(QStringLiteral("I 帧间隔"), m_iPeriodSpin));
+
     auto *apply = button(QStringLiteral("下发流参数"), QStringLiteral("primary"));
     v->addWidget(apply);
+    auto *applyEnc = button(QStringLiteral("下发编码参数"), QStringLiteral("primary"));
+    v->addWidget(applyEnc);
     /* ① 路线（2026-10-16）：raw 连续流只有 ~1.4MB/s（≈2.3fps），但单帧 0.5s 就能拿到，
        颜色标定/取证足够——一键"开流( raw )→取一帧→停流→存 PNG"。 */
     auto *grabRawBtn = button(QStringLiteral("抓一帧 raw → PNG"));
@@ -449,7 +460,8 @@ QWidget *MainWindow::buildStreamTab()
     v->addStretch(1);
     v->addWidget(dimLabel(QStringLiteral("提示：raw 档 614KB/帧，连续推流实测 ~1.4MB/s（≈2.3fps）；\n"
                                          "「抓一帧 raw」会自动开流→取帧→停流（约 0.5s）。\n"
-                                         "JPEG 档可稳定 ~8-11fps，日常预览用它。")));
+                                         "JPEG 档可稳定 ~8-11fps，日常预览用它。\n"
+                                         "编码参数仅 H.264 固件生效；QP 下限必须小于上限（相等会关闭码控）。")));
 
     /* 滑块 <-> 数字框联动 */
     connect(m_fpsS, &QSlider::valueChanged, m_fpsSpin, &QSpinBox::setValue);
@@ -466,6 +478,29 @@ QWidget *MainWindow::buildStreamTab()
         o.insert(QStringLiteral("fmt"), m_fmtBox->currentData().toString());
         cmd(o);
         cmd(cmdObj(QStringLiteral("src"), QStringLiteral("value"), m_srcBox->currentData().toString()));
+    });
+
+    connect(applyEnc, &QPushButton::clicked, this, [this]() {
+        if (m_syncing || !m_link->isConnected()) {
+            statusError(QStringLiteral("请先连接"));
+            return;
+        }
+        if (m_qpMinSpin->value() >= m_qpMaxSpin->value()) {
+            statusError(QStringLiteral("QP 下限必须小于上限（相等会关闭码控）"));
+            return;
+        }
+        /* 不带 value：只改编码参数，不切换流的开关状态 */
+        QJsonObject o = cmdObj(QStringLiteral("stream"));
+        o.insert(QStringLiteral("bitrate"), m_brSpin->value() * 1000);
+        o.insert(QStringLiteral("qp_min"), m_qpMinSpin->value());
+        o.insert(QStringLiteral("qp_max"), m_qpMaxSpin->value());
+        o.insert(QStringLiteral("i_period"), m_iPeriodSpin->value());
+        appendLog(QStringLiteral("→ 编码参数：%1 kbps / QP%2-%3 / I=%4")
+                      .arg(m_brSpin->value())
+                      .arg(m_qpMinSpin->value())
+                      .arg(m_qpMaxSpin->value())
+                      .arg(m_iPeriodSpin->value()));
+        cmd(o);
     });
 
     connect(grabRawBtn, &QPushButton::clicked, this, [this]() {
@@ -925,7 +960,7 @@ void MainWindow::syncFromResult(const QJsonObject &obj)
     }
 
     /* link 强制态回填 + 流开关状态 */
-    if (ack == QLatin1String("link") && !msg.isEmpty()) {
+    if (ack == QLatin1String("link") && !msg.isEmpty() && msg != QLatin1String("h264-only")) {
         const int eq = msg.indexOf(QStringLiteral("link="));
         if (eq >= 0) {
             const QString v = msg.mid(eq + 5).section(QLatin1Char(' '), 0, 0);
@@ -938,6 +973,20 @@ void MainWindow::syncFromResult(const QJsonObject &obj)
         const bool on = msg.startsWith(QStringLiteral("stream=on")) || msg.contains(QStringLiteral("on"));
         setStreamUi(on && msg.startsWith(QStringLiteral("stream=on")));
     }
+    /* H.264 固件的 stream ack：无 msg，字段为 bitrate/qp_min/qp_max/i_period */
+    if (ack == QLatin1String("stream") && obj.contains(QStringLiteral("bitrate"))) {
+        const int br = obj.value(QStringLiteral("bitrate")).toInt();
+        m_brSpin->setValue(qBound(25, br / 1000, 2500));
+        m_qpMinSpin->setValue(obj.value(QStringLiteral("qp_min")).toInt());
+        m_qpMaxSpin->setValue(obj.value(QStringLiteral("qp_max")).toInt());
+        m_iPeriodSpin->setValue(obj.value(QStringLiteral("i_period")).toInt());
+        m_streamOn = obj.value(QStringLiteral("value")).toBool();
+        appendLog(QStringLiteral("编码：%1 kbps / QP%2-%3 / I=%4")
+                      .arg(m_brSpin->value())
+                      .arg(m_qpMinSpin->value())
+                      .arg(m_qpMaxSpin->value())
+                      .arg(m_iPeriodSpin->value()));
+    }
 
     m_syncing = false;
 }
@@ -945,9 +994,6 @@ void MainWindow::syncFromResult(const QJsonObject &obj)
 void MainWindow::setStreamUi(bool on)
 {
     m_streamOn = on;
-    m_streamBtn->setText(on ? QStringLiteral("停止流") : QStringLiteral("开始流"));
-    m_streamBtn->setProperty("cls", on ? QStringLiteral("danger") : QStringLiteral("primary"));
-    m_streamBtn->style()->polish(m_streamBtn);
 }
 
 void MainWindow::saveScreenshot()

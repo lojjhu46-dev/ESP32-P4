@@ -7,6 +7,7 @@
 
 #include "serial_transport.h"
 #include "tcp_transport.h"
+#include "h264_player.h"
 
 LinkSession::LinkSession(QObject *parent)
     : QObject(parent)
@@ -65,6 +66,27 @@ void LinkSession::attach(ITransport *tp)
         close();
     });
     m_parser.reset();
+
+    /* 每次连接重建 0x07 解码器：上一次的 FFmpeg 读线程/管道状态不复用 */
+    if (m_h264) {
+        delete m_h264;
+        m_h264 = nullptr;
+    }
+    m_h264 = new H264LivePlayer(this);
+    connect(m_h264, &H264LivePlayer::frameReady, this, [this](const QImage &img) {
+        VideoFrame vf;
+        vf.image = img;
+        vf.width = img.width();
+        vf.height = img.height();
+        vf.fmt = 2;                     /* 2 = H.264 解码帧 */
+        vf.bytes = m_st.lastBytes;
+        vf.tsMs = QDateTime::currentMSecsSinceEpoch();
+        emit videoFrame(vf);
+    });
+    connect(m_h264, &H264LivePlayer::errorChanged, this, [this](const QString &m) {
+        emit decodeError(QStringLiteral("H.264: %1").arg(m));
+    });
+
     emit connected(tp->describe());
 }
 
@@ -81,6 +103,10 @@ void LinkSession::close()
 
     m_iface.clear();
     m_pending.clear();
+    if (m_h264) {
+        delete m_h264;
+        m_h264 = nullptr;
+    }
     if (m_db.pump) {
         m_db.pump->stop();
         m_db.pump->deleteLater();
@@ -187,6 +213,7 @@ void LinkSession::handleFrame(const jcl::Frame &f)
         QString err;
         if (decodeImageFrame(f.payload, m_swapRaw, &vf, &err)) {
             m_st.lastRaw = (vf.fmt == 1);
+            m_st.lastFmt = (vf.fmt == 1) ? QStringLiteral("raw") : QStringLiteral("jpeg");
             m_st.lastBytes = vf.bytes;
             emit videoFrame(vf);
             /* ① 路线：raw 按需单帧抓取（见 startRawGrab）——收到第一张 raw 帧即落盘并停流 */
@@ -207,6 +234,41 @@ void LinkSession::handleFrame(const jcl::Frame &f)
         } else {
             m_st.imgDrop++;
             emit decodeError(err);
+        }
+        break;
+    }
+
+    case jcl::T_H264: {
+        /* 0x07：20B 头 + Annex-B AU。头见 app_usb_link.h：
+           codec u8 | flags u8 | stream_id u16 | pts_us u32 | frame_seq u32 |
+           width u16 | height u16 | nal_len u32 */
+        const QByteArray &p = f.payload;
+        if (p.size() < 20) {
+            m_st.imgDrop++;
+            emit decodeError(QStringLiteral("0x07 载荷不足 20 字节"));
+            break;
+        }
+        const auto *b = reinterpret_cast<const quint8 *>(p.constData());
+        const quint8 codec = b[0];
+        const quint8 flags = b[1];
+        const quint16 w = quint16(b[12] | (b[13] << 8));
+        const quint16 h = quint16(b[14] | (b[15] << 8));
+        const quint32 nalLen = quint32(b[16]) | (quint32(b[17]) << 8) |
+                               (quint32(b[18]) << 16) | (quint32(b[19]) << 24);
+        if (codec != 1 || nalLen == 0 || qint64(20) + qint64(nalLen) > qint64(p.size())) {
+            m_st.imgDrop++;
+            emit decodeError(QStringLiteral("0x07 头非法（codec=%1 nal_len=%2 size=%3）")
+                                 .arg(codec).arg(nalLen).arg(p.size()));
+            break;
+        }
+        m_st.rxH264++;
+        m_st.lastFmt = QStringLiteral("h264");
+        m_st.lastBytes = int(nalLen);
+        m_winBytes += quint64(nalLen);
+        m_winFrames++;
+        if (m_h264) {
+            /* bit1 = has_sps_pps；解码器要等第一个带参数集的关键帧才开始 */
+            m_h264->feed(p.mid(20, int(nalLen)), (flags & 0x02) != 0, w, h);
         }
         break;
     }

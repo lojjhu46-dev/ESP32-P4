@@ -18,6 +18,7 @@ set(SOURCES
     src/serial_transport.cpp
     src/link_session.cpp
     src/image_frame.cpp
+    src/h264_player.cpp
     src/video_view.cpp
     src/main_window.cpp
     src/selftest.cpp
@@ -32,6 +33,7 @@ set(HEADERS
     src/serial_transport.h
     src/link_session.h
     src/image_frame.h
+    src/h264_player.h
     src/video_view.h
     src/main_window.h
     src/selftest.h

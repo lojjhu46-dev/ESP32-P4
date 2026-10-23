@@ -68,7 +68,6 @@ private:
     QPushButton *m_refreshPortsBtn = nullptr;
     QLabel      *m_linkBadge = nullptr;
     QComboBox   *m_linkModeBox = nullptr;
-    QPushButton *m_streamBtn = nullptr;
     QPushButton *m_shotBtn = nullptr;
     QComboBox   *m_zoomBox = nullptr;
 
@@ -88,6 +87,11 @@ private:
     QComboBox *m_fmtBox = nullptr;
     QComboBox *m_srcBox = nullptr;
     QCheckBox *m_swapChk = nullptr;
+    /* H.264 编码参数（仅 YUV420 固件；字段与 app_h264enc_cmd_cb 对齐） */
+    QSpinBox *m_brSpin = nullptr;       /* kbps，下发时 ×1000 */
+    QSpinBox *m_qpMinSpin = nullptr;
+    QSpinBox *m_qpMaxSpin = nullptr;
+    QSpinBox *m_iPeriodSpin = nullptr;
 
     /* 名单 */
     QTableWidget *m_roster = nullptr;

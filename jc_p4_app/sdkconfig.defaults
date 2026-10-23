@@ -49,6 +49,12 @@ CONFIG_CAMERA_SC2336_AUTO_DETECT=y
 CONFIG_CAMERA_SC2336_AUTO_DETECT_MIPI_INTERFACE_SENSOR=y
 CONFIG_CAMERA_SC2336_MIPI_RAW10_640X480_50FPS=y
 
+# ⛔ 不要在这里默认打开 H.264 硬编设备：开启后 esp_video_init() 占内部 RAM，
+# faceai 挂 /storage(FAT+WL) 会 ESP_ERR_NO_MEM → 删除/注册全部失效。
+# 证据见 docs/2026-10-22_storage挂载失败_删除注册失效_修复记录.md。
+# M0 探针阶段需要时，只在 jc_p4_app/sdkconfig 里临时打开并 reconfigure：
+# CONFIG_ESP_VIDEO_ENABLE_HW_H264_VIDEO_DEVICE=y
+
 # ISP 自动曝光/白平衡（AE/AWB）控制器：实测在我们这套配置下它会把曝光从默认的
 # 满帧(994)压到 ~519 却不加增益，画面反而更暗；增益交给 APP_CAM_DEF_GAIN 手动设。
 # ⚠️ 想再试 AE 时把它改回 y 对比（记得同时看 {"cmd":"cam"} 的 exp/gain 读数）。

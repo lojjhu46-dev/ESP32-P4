@@ -2,8 +2,10 @@
  * app_camera.c —— 板载 SC2336 (MIPI-CSI) 持续采集 → app_imgpipe
  *
  *   esp_video(V4L2) 打开 /dev/video0，3 个 mmap 缓冲循环 DQBUF/QBUF；
- *   每帧把 ISP 输出（RGB565）推进图像管道：app_imgpipe_publish_raw()。
+ *   每帧把 ISP 输出推进图像管道：app_imgpipe_publish_raw()。
  *   管道处于 PC 源模式时 publish 返回非 OK，帧直接丢（不影响出流）。
+ *   输出格式由 CONFIG_APP_CAM_OUT_FMT 选择：RGB565（既有链路）或
+ *   YUV420（H.264 硬编，帧经 app_camera_set_frame_cb 同步旁路）。
  *
  * 排查备忘（2026-09-30 实测）：
  *   - sccb_config.freq 必须给（0 会 invalid scl frequency，传感器压根不探测）
@@ -57,6 +59,7 @@ static struct {
     uint32_t fourcc;
     volatile bool streaming;
     bool     sensor_hflip;              /* 传感器 HMIRROR 已生效（软件镜像就不用做了） */
+    app_camera_frame_cb_t frame_cb;     /* 帧旁路（H.264 编码），在 QBUF 前同步调用 */
     uint32_t frames;
     uint32_t dropped;
 } s_cam = { .fd = -1 };
@@ -353,14 +356,33 @@ static void camera_task(void *arg)
             continue;
         }
 
-        if (!(buf.flags & V4L2_BUF_FLAG_ERROR) && buf.bytesused > 0 && buf.index < CAM_BUF_COUNT) {
+        bool frame_ok = !(buf.flags & V4L2_BUF_FLAG_ERROR) && buf.index < CAM_BUF_COUNT;
+#if CONFIG_APP_CAM_OUT_FMT_YUV420
+        /* esp_video 在 YUV420 下可能不回填 bytesused（并行探针实测约一半为 0）。
+           帧长由 w*h*3/2 自算，不能拿 bytesused 当有效性判据，否则会丢掉一半帧。 */
+        static bool warned_bytesused;
+        if (frame_ok && buf.bytesused == 0 && !warned_bytesused) {
+            warned_bytesused = true;
+            ESP_LOGW(TAG, "YUV420 frame with bytesused=0; using w*h*3/2 anyway");
+        }
+#else
+        frame_ok = frame_ok && buf.bytesused > 0;
+#endif
+        if (frame_ok) {
             s_cam.frames++;
             win_cnt++;
+            /* 旁路必须赶在下面的 QBUF 之前：归还驱动后这块 mmap 缓冲随时会被覆盖 */
+            if (s_cam.frame_cb) {
+                s_cam.frame_cb((const uint8_t *)s_cam.buf[buf.index].start,
+                               s_cam.width, s_cam.height, s_cam.stride, s_cam.fourcc);
+            }
+#if CONFIG_APP_ENABLE_IMG_PIPE
             if (app_imgpipe_publish_raw((const uint8_t *)s_cam.buf[buf.index].start,
                                         s_cam.width, s_cam.height, s_cam.stride,
                                         IMG_FMT_RGB565) != ESP_OK) {
                 s_cam.dropped++;        /* 消费者还没放槽 / 当前是 PC 源 */
             }
+#endif
         } else {
             s_cam.dropped++;
         }
@@ -378,10 +400,16 @@ static void camera_task(void *arg)
         if (now - win >= CAM_STATUS_US) {
             float fps = (float)win_cnt * 1000000.0f / (float)(now - win);
             app_status_set(APP_MOD_CAM, true, "%dx%d %.0ffps", s_cam.width, s_cam.height, (double)fps);
+#if CONFIG_APP_ENABLE_IMG_PIPE
             ESP_LOGI(TAG, "capture %dx%d %.1ffps frames=%u drop=%u src=%s",
                      s_cam.width, s_cam.height, (double)fps,
                      (unsigned)s_cam.frames, (unsigned)s_cam.dropped,
                      app_imgpipe_src_str(app_imgpipe_get_src()));
+#else
+            ESP_LOGI(TAG, "capture %dx%d %.1ffps frames=%u drop=%u (imgpipe off)",
+                     s_cam.width, s_cam.height, (double)fps,
+                     (unsigned)s_cam.frames, (unsigned)s_cam.dropped);
+#endif
             win = now;
             win_cnt = 0;
         }
@@ -394,6 +422,11 @@ static void camera_task(void *arg)
 bool app_camera_ready(void)
 {
     return s_cam.streaming && s_cam.fd >= 0;
+}
+
+void app_camera_set_frame_cb(app_camera_frame_cb_t cb)
+{
+    s_cam.frame_cb = cb;
 }
 
 /* 传感器 HMIRROR 是否已生效（imgpipe 据此跳过软件镜像，省一次全帧内存遍历） */
@@ -696,6 +729,52 @@ esp_err_t app_camera_init(void)
     s_cam.width = fmt.fmt.pix.width;
     s_cam.height = fmt.fmt.pix.height;
     s_cam.fourcc = fmt.fmt.pix.pixelformat;
+
+#if CONFIG_APP_CAM_OUT_FMT_YUV420
+    /* H.264 硬编通路：ISP 直出 YUV420。esp_video 的 CSI 设备要求 S_FMT 宽高与
+       当前配置一致（只允许换 fourcc），且 YUV420 无行填充（stride == width）。 */
+    if ((s_cam.width & 1) || (s_cam.height & 1)) {
+        ESP_LOGE(TAG, "YUV420 needs even dimensions, got %dx%d", s_cam.width, s_cam.height);
+        app_status_set(APP_MOD_CAM, false, "odd dims");
+        close(s_cam.fd);
+        s_cam.fd = -1;
+        return ESP_ERR_INVALID_ARG;
+    }
+    /* ⚠️ G_FMT 会 memcpy 整个 stream->format，而 esp_video 初始化时只写了
+       width/height/fourcc，type 仍是 0。直接拿这个结构体去做 S_FMT 会走
+       esp_video_get_stream(type=0) -> NULL -> EINVAL，且驱动不打任何日志。
+       所以这里必须像厂商 uvc 例程一样显式重置 type/尺寸/填充字段。 */
+    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    fmt.fmt.pix.width = s_cam.width;
+    fmt.fmt.pix.height = s_cam.height;
+    fmt.fmt.pix.bytesperline = 0;
+    fmt.fmt.pix.sizeimage = 0;
+    fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUV420;
+    if (ioctl(s_cam.fd, VIDIOC_S_FMT, &fmt) != 0) {
+        ESP_LOGE(TAG, "S_FMT(YUV420) failed: errno %d -> M0 R1: ISP cannot output YUV420",
+                 errno);
+        app_status_set(APP_MOD_CAM, false, "no yuv420");
+        close(s_cam.fd);
+        s_cam.fd = -1;
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    if (ioctl(s_cam.fd, VIDIOC_G_FMT, &fmt) != 0 ||
+            fmt.fmt.pix.pixelformat != V4L2_PIX_FMT_YUV420) {
+        ESP_LOGE(TAG, "S_FMT(YUV420) not applied (fourcc=%08X) -> M0 R1",
+                 (unsigned)fmt.fmt.pix.pixelformat);
+        app_status_set(APP_MOD_CAM, false, "no yuv420");
+        close(s_cam.fd);
+        s_cam.fd = -1;
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    s_cam.width = fmt.fmt.pix.width;
+    s_cam.height = fmt.fmt.pix.height;
+    s_cam.fourcc = fmt.fmt.pix.pixelformat;
+    s_cam.stride = fmt.fmt.pix.bytesperline ? (int)fmt.fmt.pix.bytesperline : s_cam.width;
+    ESP_LOGI(TAG, "format %dx%d fourcc=%08X stride=%d frame=%u B (YUV420 -> H.264)",
+             s_cam.width, s_cam.height, s_cam.fourcc, s_cam.stride,
+             (unsigned)(s_cam.width * s_cam.height * 3 / 2));
+#else
     s_cam.stride = fmt.fmt.pix.bytesperline ? (int)fmt.fmt.pix.bytesperline : s_cam.width * 2;
     ESP_LOGI(TAG, "format %dx%d fourcc=%08X stride=%d", s_cam.width, s_cam.height,
              s_cam.fourcc, s_cam.stride);
@@ -703,6 +782,7 @@ esp_err_t app_camera_init(void)
         ESP_LOGW(TAG, "expected RGB565 (fourcc RGBP), got %08X - publish will treat as RGB565",
                  s_cam.fourcc);
     }
+#endif
 
     struct v4l2_requestbuffers req = {
         .count = CAM_BUF_COUNT,
@@ -747,6 +827,33 @@ esp_err_t app_camera_init(void)
         return ESP_FAIL;
     }
 
+#if CONFIG_APP_CAM_OUT_FMT_YUV420
+    /* M0 关闭了 FACEAI（app 级 AE 寄生在它的 init 里），sensor 默认曝光是满帧
+       994 行 → 室内过曝成纯白（并行探针实测 YAVG≈253），码率统计会全部失真。
+       固定成白天档 gain72/exp519（HANDOVER 实测 avg_luma≈120）。曝光单位是行。 */
+    app_cam_ctrl_t defc = {
+        .gain_val = CONFIG_APP_CAM_DEF_GAIN,
+        .exp_val = CONFIG_APP_H264_EXP_LINES,
+    };
+    /* 注意：sc2336 不支持 V4L2_CID_EXPOSURE_AUTO（实测 ctrl id=9a0901 not supported），
+       但 exp/gain 的 S_EXT_CTRLS 是生效的（日志 ctrl 0x00980911 <- N）。 */
+    if (app_camera_set_ctrl(&defc, APP_CAM_SET_GAIN | APP_CAM_SET_EXP) != ESP_OK) {
+        ESP_LOGW(TAG, "set default gain/exp failed (gain=%d exp=%d lines)",
+                 CONFIG_APP_CAM_DEF_GAIN, CONFIG_APP_H264_EXP_LINES);
+    }
+    ESP_LOGI(TAG, "M0 fixed exposure: gain=%d exp=%d lines (AE off)",
+             CONFIG_APP_CAM_DEF_GAIN, CONFIG_APP_H264_EXP_LINES);
+
+    /* 生产链路靠 sensor HMIRROR + imgpipe 软件镜像；M0 不走 imgpipe，且 sensor class
+       的 HMIRROR 在本板 set 失败（errno 3）。改用实测可用的 V4L2_CID_HFLIP
+       (0x00980914) 在硬件上游镜像，零 CPU 成本。 */
+    app_cam_ctrl_t hf = { .hflip_val = 1 };
+    if (app_camera_set_ctrl(&hf, APP_CAM_SET_HFLIP) != ESP_OK) {
+        ESP_LOGW(TAG, "V4L2 hflip failed; H.264 image will be mirrored");
+    } else {
+        ESP_LOGI(TAG, "H.264 hflip ON (V4L2_CID_HFLIP)");
+    }
+#else
     /* 默认增益：实测（2026-09-30）esp_video 的 AE/AGC 不会动增益（恒为 0 = 最小增益），
        不设的话画面 avg_luma≈30 一片黑；SC2336 增益 0..192，72 ≈ 室内正常亮度(avg≈120)。
        夜视测试：{"cmd":"cam","gain":192}（配合 exp 一起调）。 */
@@ -754,6 +861,7 @@ esp_err_t app_camera_init(void)
     if (app_camera_set_ctrl(&defc, APP_CAM_SET_GAIN) != ESP_OK) {
         ESP_LOGW(TAG, "set default gain %d failed", CONFIG_APP_CAM_DEF_GAIN);
     }
+#endif
 
     /* 镜像走传感器 HMIRROR（本地 patch 后 set_ext_ctrls_to_sensor 已接通，sc2336 驱动
        有 set 分支）：在数据源头翻转，AI/回传天然一致，且省掉 imgpipe 每帧一次的
@@ -761,7 +869,8 @@ esp_err_t app_camera_init(void)
        ⚠️ 只信 SET 的返回值——sc2336 驱动的 get 分支没实现（get 必失败），拿 GET
        验证会把 SET 成功也误判成不可用。 */
     s_cam.sensor_hflip = false;
-#if CONFIG_APP_CAM_HFLIP
+#if CONFIG_APP_CAM_HFLIP && !CONFIG_APP_CAM_OUT_FMT_YUV420
+    /* YUV420/H.264 路径已在上面用 V4L2_CID_HFLIP 镜像，这里避免重复镜像 */
     if (app_camera_set_sensor(APP_CAM_CTL_HMIRROR, 1) == ESP_OK) {
         s_cam.sensor_hflip = true;
         ESP_LOGI(TAG, "sensor hmirror ON (software hflip disabled)");
@@ -791,10 +900,16 @@ esp_err_t app_camera_init(void)
     /* 初始白平衡：ISP 硬件可用就走 WBG（软件路径保持 1000=不二次校正），
        否则维持 imgpipe 的软件默认值（init 里已设 CONFIG 默认） */
     if (s_isp.fd >= 0) {
+#if CONFIG_APP_CAM_OUT_FMT_YUV420
+        /* M0 没有 AWB 闭环：CAM_WB_KR/KB 是给 AWB 的偏置，直接用会整体偏粉紫 */
+        cam_mreq_args_t a = { .wb_kr = CONFIG_APP_H264_WB_KR,
+                              .wb_kb = CONFIG_APP_H264_WB_KB };
+#else
         cam_mreq_args_t a = { .wb_kr = CONFIG_APP_CAM_WB_KR, .wb_kb = CONFIG_APP_CAM_WB_KB };
+#endif
         cam_mreq_post(CAM_MREQ_WB, &a);
         ESP_LOGI(TAG, "white balance -> ISP hardware WBG (%d/%d permille)",
-                 CONFIG_APP_CAM_WB_KR, CONFIG_APP_CAM_WB_KB);
+                 a.wb_kr, a.wb_kb);
         /* 初始 CCM：IPA 控制器关闭后厂商标定矩阵从未下发（白天色偏主因），
            随 WB 一起在 camera_task 安全点下发；mix=0 时 CCM 模块保持禁用 */
 #if CONFIG_APP_CAM_CCM_MIX > 0
