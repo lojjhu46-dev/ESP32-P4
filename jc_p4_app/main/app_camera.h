@@ -30,6 +30,10 @@ typedef void (*app_camera_frame_cb_t)(const uint8_t *data, int w, int h,
                                       int stride, uint32_t fourcc);
 void app_camera_set_frame_cb(app_camera_frame_cb_t cb);
 
+/* 追加一路帧回调（槽 0 由 set_frame_cb 占用，最多 3 路）。回调仍按注册顺序在
+ * QBUF 前同步执行，必须尽快返回。须在 app_camera_init() 之前注册。 */
+esp_err_t app_camera_add_frame_cb(app_camera_frame_cb_t cb);
+
 /* 摄像头是否已出流（imgpipe 用它决定默认图像源） */
 bool app_camera_ready(void);
 

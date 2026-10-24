@@ -482,11 +482,13 @@ menu "JC P4 App Configuration"
 
     config APP_CAM_AE_FLICKER50
         bool "AE anti-flicker: quantize exposure to 10ms steps (50Hz mains)"
-        default y
+        default y if !APP_CAM_OUT_FMT_YUV420
         depends on APP_CAM_AE
         help
             市电照明下曝光取 10ms（500 行，SC2336 行时间 20µs）整数倍可避免
             画面滚动暗带。代价是曝光粒度变粗（细调由增益承担）。
+            YUV420/H.264 路径（M2）默认关闭：当前场景短曝光即可到目标亮度，
+            强制 ≥500 行会过曝；运行时可 {"cmd":"cam","flicker50":1} 开回。
 
     config APP_CAM_AE_EXP_MAX_MS
         int "AE exposure cap in ms (0 = uncapped, fps-tier maximum)"
@@ -600,14 +602,22 @@ menu "JC P4 App Configuration"
         bool "Enable MIPI-CSI camera (esp_video, SC2336)"
         default y
 
+    config APP_ENABLE_SDCARD
+        bool "Enable TF card mount (/sdcard)"
+        default y
+        help
+            M2/H.264 固件可不插卡：关闭后省掉 SDMMC 初始化，并避免 SD 挂载失败
+            占用 FATFS 卷上下文（FF_VOLUMES=2），否则 /storage 会注册失败 NO_MEM。
+
     choice APP_CAM_OUT_FMT
         prompt "Camera output pixel format"
         default APP_CAM_OUT_FMT_RGB565
         depends on APP_ENABLE_CAMERA
         help
             ISP 同一时刻只能输出一种格式。RGB565 是既有链路（imgpipe/AI/JPEG 预览）；
-            YUV420 是 H.264 硬编通路（摄像头 -> /dev/video11）。选 YUV420 时必须
-            关闭 IMG_PIPE/STREAM/FACEAI，否则下游会按 RGB565 误读。
+            YUV420 是 H.264 硬编通路（摄像头 -> /dev/video11）。
+            YUV420 + FACEAI 时由 app_yuv2rgb 把 5fps 送检帧经 PPA 转 RGB565 后
+            推进 imgpipe（见 §14），不再要求关闭 IMG_PIPE。
 
         config APP_CAM_OUT_FMT_RGB565
             bool "RGB565 (imgpipe / AI / JPEG preview)"
@@ -727,5 +737,35 @@ menu "JC P4 App Configuration"
         default 1000
         range 500 3000
         depends on APP_CAM_OUT_FMT_YUV420
+
+    config APP_AI_DETECT
+        bool "Face detection alongside H.264 (detection boxes only)"
+        default y
+        depends on APP_CAM_OUT_FMT_YUV420
+        help
+            抽帧（默认 5fps）做 YUV420→RGB565（PPA，失败回退 CPU）→ esp-dl
+            MSRMNP，只回检测框（0x02 boxes），不挂 /storage、不做识别。
+            H.264 编码仍保持 25fps。
+
+    config APP_AI_DETECT_FPS
+        int "Detection frame rate (frames sent to AI per second)"
+        default 5
+        range 1 15
+        depends on APP_AI_DETECT
+
+    config APP_AI_DETECT_SCORE
+        int "Detection score threshold (percent)"
+        default 50
+        range 10 95
+        depends on APP_AI_DETECT
+
+    config APP_AI_DETECT_CONVERT_PPA
+        bool "Convert YUV420->RGB565 with PPA (fallback: CPU)"
+        default y
+        depends on APP_AI_DETECT
+        help
+            ISP 的 YUV420 实际是 O_UYY_E_VYY 打包布局（u y y / v y y 逐行交替）；
+            PPA 的 YUV420 输入正好按这个布局解释（实测首帧像素对照 delta=0）。
+            PPA 不可用/结果不符时自动回退 CPU 转换（约 10-20ms/帧 @5fps）。
 
 endmenu

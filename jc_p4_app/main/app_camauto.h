@@ -25,6 +25,18 @@ extern "C" {
 
 void app_camauto_init(void);
 
+/* --- YUV420/H.264 路径（M2）---
+ * 没有 imgpipe 时由相机帧回调直接喂 Y 平面亮度。register 必须赶在
+ * app_camera_init() 之前调用；AWB/夜视增强在 YUV420 下自动关闭（无 RGB 统计）。 */
+void app_camauto_register(void);
+void app_camauto_feed_luma(int luma);
+int  app_camauto_get_luma(void);
+bool app_camauto_get_state(int *exp, int *gain, int *luma, bool *ae);
+/* 50Hz 抗频闪：曝光量化到 500 行（10ms）整数倍。M2 默认关闭（当前场景
+ * 短曝光即可到目标亮度，强制 500 行会过曝）。 */
+void app_camauto_set_flicker50(bool on);
+bool app_camauto_get_flicker50(void);
+
 /* --- 开关（默认值来自 Kconfig APP_CAM_AE / APP_CAM_AWB）--- */
 void app_camauto_set_ae(bool on);
 void app_camauto_set_awb(bool on);

@@ -219,6 +219,9 @@ static void parser_feed(uint8_t b)
 static void usb_rx_task(void *arg)
 {
     static uint8_t buf[512];
+    /* 预热 newlib stdio 锁：本任务平时不打印，首次打印若赶上内部 RAM 碎片化
+       会因 xQueueCreateMutex 失败直接 abort（实测）。启动时内存宽裕。 */
+    ESP_LOGI(TAG, "usb_rx task started");
     while (1) {
         uint32_t n = ring_pop(buf, sizeof(buf));
         if (n == 0) {
@@ -238,6 +241,10 @@ static void usb_rx_task(void *arg)
  *   （TCP 走另一个后端，所以一直没暴露；这也是 USB 视频流从没跑起来的原因）。
  *   正确用法：按返回值推进，返回 0 = FIFO 满。
  * 策略与 TCP 后端一致：非阻塞推进 + 总预算（TX_BUDGET_US），超预算丢帧不阻塞调用者。 */
+/* 当前帧的发送预算（tx_lock 串行化，写入者唯一）：视频帧用短预算快速丢帧，
+   控制帧/ack 保持长预算，避免 H.264 连续发送把 ack 饿死。 */
+static volatile uint32_t s_tx_budget_us = TX_BUDGET_US;
+
 static esp_err_t cdc_write(const uint8_t *data, uint32_t len)
 {
     if (!s_lk.cdc_up) {
@@ -258,7 +265,7 @@ static esp_err_t cdc_write(const uint8_t *data, uint32_t len)
              * （USB 下 JPEG 只能到 10.5fps，raw 614KB 帧直接超预算被截断）。
              * 改成 **μs 级忙等**（tinyusb 任务优先级更高会抢占，或跑在另一核）：
              * 连续忙等 64 次后再让出 1 tick，兼顾吞吐与不饿死其它任务。 */
-            if (esp_timer_get_time() - t0 > TX_BUDGET_US) {
+            if (esp_timer_get_time() - t0 > (int64_t)s_tx_budget_us) {
                 return ESP_ERR_TIMEOUT;
             }
             if (++spins < 64) {
@@ -422,6 +429,8 @@ static esp_err_t send_vect(uint8_t type,
 
     int64_t t0 = esp_timer_get_time();
     xSemaphoreTake(s_lk.tx_lock, portMAX_DELAY);
+    /* 视频帧拥塞时快速丢帧（50ms），把 tx_lock 尽快让给 0x02 ack/日志 */
+    s_tx_budget_us = (type == JCL_TYPE_H264) ? 50000 : TX_BUDGET_US;
     const jcl_transport_t *tp = s_lk.tp ? s_lk.tp : &s_cdc_tp;
     esp_err_t err = tp->write(h, sizeof(h));
     if (err == ESP_OK && hdr_len) {
@@ -444,13 +453,8 @@ static esp_err_t send_vect(uint8_t type,
         s_lk.tx.tx_last_ms = (uint32_t)((esp_timer_get_time() - t0) / 1000);
     } else {
         s_lk.tx.tx_drop++;
-        /* 限流：断链时每帧都失败，不能每帧刷一条（会拖慢串口/CPU） */
-        TickType_t now = xTaskGetTickCount();
-        if (now - s_lk.send_fail_tick > pdMS_TO_TICKS(5000)) {
-            s_lk.send_fail_tick = now;
-            ESP_LOGW(TAG, "send type=%u len=%u via %s failed: %s (cdc_up=%d)",
-                     type, (unsigned)len, tp->name, esp_err_to_name(err), (int)s_lk.cdc_up);
-        }
+        /* 不在这里打日志：本函数可能在 usb_rx/驱动任务里，运行期首次 stdio
+           锁分配在内部 RAM 碎片化后会 abort（实测）。失败只看 tx_drop 计数。 */
     }
     return err;
 }

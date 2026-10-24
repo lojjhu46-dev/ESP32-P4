@@ -13,6 +13,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_check.h"
+#include "linux/videodev2.h"
 
 #include "app_camauto.h"
 #include "app_camera.h"
@@ -32,6 +33,9 @@
 #endif
 #ifndef CONFIG_APP_CAM_AE_TARGET
 #define CONFIG_APP_CAM_AE_TARGET 120
+#endif
+#ifndef CONFIG_APP_CAM_AE_FLICKER50
+#define CONFIG_APP_CAM_AE_FLICKER50 0
 #endif
 #ifndef CONFIG_APP_CAM_AWB_MIN_LUMA
 #define CONFIG_APP_CAM_AWB_MIN_LUMA 40
@@ -78,6 +82,8 @@ static struct {
     /* 引擎视角的传感器状态（信箱写入的值也记在这里） */
     bool     view_valid;
     int      cur_exp, cur_gain;
+    int      exp_min;             /* 驱动曝光下限（行） */
+    int      flicker_step;        /* 0=关；500=50Hz 10ms 量化 */
     /* tick 传入的环境 */
     int      fps, exp_max, gain_max;
     /* 节流 */
@@ -95,40 +101,63 @@ static struct {
     int      bf;                  /* 当前下发的 BF level（-1=未下发） */
     int      luma_ema;            /* 亮度 EMA（-1=未建立） */
     int64_t  last_enh_us;
+    /* YUV420 路径：相机帧回调喂入的 Y 平面均值（imgpipe 关闭时用） */
+    volatile int     feed_luma;   /* -1 = 尚无采样 */
+    volatile int64_t feed_us;
+    int64_t  last_ae_log_us;
 } s = {
     .ae_on = CONFIG_APP_CAM_AE,
     .awb_on = CONFIG_APP_CAM_AWB,
     .target = CONFIG_APP_CAM_AE_TARGET,
+    .exp_min = AE_EXP_MIN,
     .exp_max = 994,
     .gain_max = 192,
+    .flicker_step = CONFIG_APP_CAM_AE_FLICKER50 ? AE_FLICKER_STEP : 0,
     .kr = CONFIG_APP_CAM_WB_KR,
     .kb = CONFIG_APP_CAM_WB_KB,
     .enh_on = CONFIG_APP_CAM_NIGHT_ENH,
     .gamma = -1,
     .bf = -1,
     .luma_ema = -1,
+    .feed_luma = -1,
 };
 
 static bool wb_via_isp(void);   /* 定义在 wb_apply 附近（init 也要用） */
 
 /* 帧内统计（luma/RGB）只在有任何自动功能需要时开启采样 */
+#if !CONFIG_APP_CAM_OUT_FMT_YUV420
 static bool stats_needed(void)
 {
     return s.ae_on || s.awb_on || s.enh_on;
 }
+#endif
 
 static void stats_update(void)
 {
+#if CONFIG_APP_CAM_OUT_FMT_YUV420
+    /* YUV420: luma 由相机帧回调直喂，imgpipe 不参与统计 */
+#else
     app_imgpipe_set_ae_stats(stats_needed());
+#endif
 }
 
 void app_camauto_init(void)
 {
+#if CONFIG_APP_CAM_OUT_FMT_YUV420
+    /* YUV420 只有 Y 平面统计：AE 闭环可用，AWB/夜视增强（需 RGB/写 gamma）关闭 */
+    s.awb_on = false;
+    s.enh_on = false;
+#endif
     ESP_LOGI(TAG, "AE=%d(target %d) AWB=%d ENH=%d flicker50=%d%s",
              (int)s.ae_on, s.target, (int)s.awb_on, (int)s.enh_on,
-             AE_FLICKER_STEP > 0 ? 1 : 0,
+             s.flicker_step > 0 ? 1 : 0,
              (s.ae_on || s.awb_on || s.enh_on) ? "" : " (all off)");
     stats_update();
+#if CONFIG_APP_CAM_OUT_FMT_YUV420
+    ESP_LOGI(TAG, "YUV420: AE on Y plane (exp_min=%d exp_max=%d gain_max=%d), "
+                  "AWB/ENH off, WB stays fixed",
+             s.exp_min, s.exp_max, s.gain_max);
+#else
     if (wb_via_isp()) {
         /* 硬件 WB 生效后软件层不能再校正：清掉 imgpipe 的默认增益（初始 WBG
            值由 app_camera_init 经信箱下发 CONFIG 默认） */
@@ -137,9 +166,86 @@ void app_camauto_init(void)
     } else {
         ESP_LOGI(TAG, "WB path: imgpipe software kr=%d kb=%d", s.kr, s.kb);
     }
+#endif
     app_usb_link_log("camauto: AE=%d AWB=%d ENH=%d target=%d wb=%s",
                      (int)s.ae_on, (int)s.awb_on, (int)s.enh_on, s.target,
+#if CONFIG_APP_CAM_OUT_FMT_YUV420
+                     "fixed");
+#else
                      wb_via_isp() ? "isp" : "soft");
+#endif
+}
+
+#if CONFIG_APP_CAM_OUT_FMT_YUV420
+/* YUV420 帧旁路：8x8 稀疏采样 Y 平面（4800 点/帧，<0.1ms），喂给 AE 引擎 */
+static void camauto_frame_cb(const uint8_t *data, int w, int h, int stride, uint32_t fourcc)
+{
+    if (!data || fourcc != V4L2_PIX_FMT_YUV420 || stride < w || w <= 0 || h <= 0) {
+        return;
+    }
+    uint32_t sum = 0;
+    int n = 0;
+    /* O_UYY_E_VYY 打包布局：每行 u y y / v y y 交替，行字节数 = w*3/2 */
+    const size_t line_bytes = (size_t)w * 3 / 2;
+    for (int y = 0; y < h; y += 8) {
+        const uint8_t *row = data + (size_t)y * line_bytes;
+        for (int pair = 0; pair < w / 2; pair += 4) {
+            sum += row[pair * 3 + 1] + row[pair * 3 + 2];
+            n += 2;
+        }
+    }
+    if (n) {
+        app_camauto_feed_luma((int)(sum / (uint32_t)n));
+        app_camauto_tick(50, 0, 0, 0, 0);   /* tick 内部 250ms 节流 */
+    }
+}
+#endif
+
+void app_camauto_register(void)
+{
+#if CONFIG_APP_CAM_OUT_FMT_YUV420
+    app_camauto_init();
+    esp_err_t err = app_camera_add_frame_cb(camauto_frame_cb);
+    ESP_LOGI(TAG, "Y-plane AE frame cb: %s", err == ESP_OK ? "registered" : "FAILED");
+#else
+    /* RGB565 生产路径仍由 app_faceai 调 app_camauto_init()/tick() */
+#endif
+}
+
+void app_camauto_feed_luma(int luma)
+{
+    s.feed_luma = luma;
+    s.feed_us = esp_timer_get_time();
+}
+
+int app_camauto_get_luma(void)
+{
+    return s.feed_luma;
+}
+
+bool app_camauto_get_state(int *exp, int *gain, int *luma, bool *ae)
+{
+    if (exp) *exp = s.cur_exp;
+    if (gain) *gain = s.cur_gain;
+    if (luma) *luma = s.feed_luma;
+    if (ae) *ae = s.ae_on;
+    return s.view_valid;
+}
+
+void app_camauto_set_flicker50(bool on)
+{
+    int step = on ? AE_FLICKER_STEP : 0;
+    if (s.flicker_step == step) {
+        return;
+    }
+    s.flicker_step = step;
+    ESP_LOGW(TAG, "flicker50 -> %d (exp quantum %d lines)", on ? 1 : 0, step);
+    app_usb_link_log("camauto: flicker50 %s", on ? "on" : "off");
+}
+
+bool app_camauto_get_flicker50(void)
+{
+    return s.flicker_step > 0;
 }
 
 void app_camauto_set_ae(bool on)
@@ -442,11 +548,12 @@ static void view_seed_once(void)
     if (app_camera_get_ctrl(&t) == ESP_OK && t.have_exp && t.have_gain) {
         s.cur_exp = (int)t.exp_val;
         s.cur_gain = (int)t.gain_val;
+        if (t.exp_min > 0) s.exp_min = (int)t.exp_min;
         if (t.exp_max > 0) s.exp_max = (int)t.exp_max;
         if (t.gain_max > 0) s.gain_max = (int)t.gain_max;
         s.view_valid = true;
-        ESP_LOGI(TAG, "view seeded: exp=%d/%d gain=%d/%d", s.cur_exp, s.exp_max,
-                 s.cur_gain, s.gain_max);
+        ESP_LOGI(TAG, "view seeded: exp=%d/%d..%d gain=%d/%d", s.cur_exp, s.exp_min,
+                 s.exp_max, s.cur_gain, s.gain_max);
     }
 }
 
@@ -468,9 +575,12 @@ static bool ae_step(int64_t now, int luma)
     if (err > -AE_DEADZONE && err < AE_DEADZONE) {
         return false;                    /* 死区内不动 */
     }
-    int exp_min = (AE_FLICKER_STEP > 0) ? AE_FLICKER_STEP : AE_EXP_MIN;
+    int exp_min = (s.flicker_step > 0) ? s.flicker_step : s.exp_min;
+    if (s.flicker_step > 0 && exp_min < AE_EXP_MIN) {
+        exp_min = AE_EXP_MIN;
+    }
     if (s.exp_max > 0 && exp_min > s.exp_max) {
-        exp_min = s.exp_max;             /* 帧率极高时上限可能低于量子（保险） */
+        exp_min = s.exp_max;             /* 帧率极高时上限可能低于下限（保险） */
     }
 
     /* 乘法律：期望的亮度比例 = 目标/当前，单步限幅 0.5x~2x */
@@ -499,8 +609,8 @@ static bool ae_step(int64_t now, int luma)
         }
     }
 
-    if (AE_FLICKER_STEP > 0 && exp > AE_FLICKER_STEP) {
-        exp = ((exp + AE_FLICKER_STEP / 2) / AE_FLICKER_STEP) * AE_FLICKER_STEP;
+    if (s.flicker_step > 0 && exp > s.flicker_step) {
+        exp = ((exp + s.flicker_step / 2) / s.flicker_step) * s.flicker_step;
     }
     exp = clampi(exp, exp_min, s.exp_max > 0 ? s.exp_max : exp);
     gain = clampi(gain, 0, s.gain_max > 0 ? s.gain_max : gain);
@@ -509,11 +619,17 @@ static bool ae_step(int64_t now, int luma)
     }
 
     app_camera_post_exp_gain(exp, gain);
+#if CONFIG_APP_ENABLE_IMG_PIPE
     app_imgpipe_reset_prev();            /* 亮度跳变 -> 降噪/运动参考帧作废 */
+#endif
     ESP_LOGI(TAG, "AE %s: luma %d tgt %d -> exp %d gain %d",
              err > 0 ? "up" : "down", luma, s.target, exp, gain);
+#if !CONFIG_APP_CAM_OUT_FMT_YUV420
+    /* ⚠️ 本函数在相机任务里执行；YUV420 路径下 USB 无人读时
+       app_usb_link_log 会阻塞到 500ms 预算，直接拖垮采集帧率。 */
     app_usb_link_log("camauto: AE %s luma %d -> exp %d gain %d",
                      err > 0 ? "up" : "down", luma, exp, gain);
+#endif
     s.cur_exp = exp;
     s.cur_gain = gain;
     s.last_step_us = now;
@@ -560,6 +676,31 @@ static void awb_step(int64_t now, int r, int g, int b, int luma)
 void app_camauto_tick(int cur_fps, int cur_gain, int exp_max, int gain_max,
                       int exp_cap_lines)
 {
+#if CONFIG_APP_CAM_OUT_FMT_YUV420
+    /* YUV420：只有 Y 平面 luma，AWB/ENH 不参与（init 已强制关闭） */
+    (void)cur_fps; (void)cur_gain; (void)exp_max; (void)gain_max; (void)exp_cap_lines;
+    if (!s.ae_on) {
+        return;
+    }
+    int64_t now = esp_timer_get_time();
+    if (now - s.last_tick_us < AE_TICK_MS * 1000) {
+        return;
+    }
+    s.last_tick_us = now;
+    if (s.feed_luma < 0 || s.feed_us == 0 || now - s.feed_us > 500 * 1000) {
+        return;                          /* 没有新鲜采样，不盲调 */
+    }
+    view_seed_once();
+    if (!s.view_valid) {
+        return;
+    }
+    ae_step(now, s.feed_luma);
+    if (now - s.last_ae_log_us > 5 * 1000 * 1000) {
+        s.last_ae_log_us = now;
+        ESP_LOGI(TAG, "luma=%d exp=%d gain=%d ae=%d", s.feed_luma, s.cur_exp,
+                 s.cur_gain, (int)s.ae_on);
+    }
+#else
     if (!s.ae_on && !s.awb_on && !s.enh_on) {
         return;
     }
@@ -608,4 +749,5 @@ void app_camauto_tick(int cur_fps, int cur_gain, int exp_max, int gain_max,
     if (s.awb_on) {
         awb_step(now, (int)st.ae_r, (int)st.ae_g, (int)st.ae_b, (int)st.ae_luma);
     }
+#endif /* CONFIG_APP_CAM_OUT_FMT_YUV420 */
 }

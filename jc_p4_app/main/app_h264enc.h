@@ -9,6 +9,7 @@
  * 三个对外函数里只有 Register 需要显式调用，且必须在 app_camera_init() 之前。
  */
 #include <stdint.h>
+#include <stdbool.h>
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -26,6 +27,10 @@ void app_h264enc_deinit(void);
    {"cmd":"stream","value":"on|off","bitrate":N,"qp_min":N,"qp_max":N,"i_period":N}
    回 0x02 {"ack":"stream", ...}。 */
 void app_h264enc_cmd_cb(const char *json, uint32_t len);
+
+/* FACEAI 构建里由 faceai 的 0x03 回调先调用：抢走 H.264 专属命令
+   （stream / detect / ai_dump，以及 FACEAI 关闭时的 cam）。返回 true=已处理并已 ack。 */
+bool app_h264enc_cmd_try(const char *json, uint32_t len);
 
 #ifdef __cplusplus
 }

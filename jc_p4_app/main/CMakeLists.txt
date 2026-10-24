@@ -5,22 +5,32 @@ set(srcs
     "app_display.c"
     "app_audio.c"
     "app_sdcard.c"
-    "app_eth.c"
     "app_rs485.c"
     "app_battery.c"
     "app_camera.c"
     "app_usb_link.c"
-    "app_netlink.c"
     "app_imgpipe.c"
+    "app_yuv2rgb.c"
     "app_stream.c"
     "app_camauto.c"
     "app_h264enc.c"
 )
 
+if(CONFIG_APP_ENABLE_ETH)
+    list(APPEND srcs "app_eth.c")
+endif()
+if(CONFIG_APP_ENABLE_NET_LINK)
+    list(APPEND srcs "app_netlink.c")
+endif()
+
 # app_faceai.cpp 只能在 FACEAI 开启时编译：它直接引用 APP_FACEAI_* 系列
 # Kconfig 符号，而这些符号随 APP_ENABLE_FACEAI/IMG_PIPE 关闭会从 sdkconfig 消失。
 if(CONFIG_APP_ENABLE_FACEAI)
     list(APPEND srcs "app_faceai.cpp")
+endif()
+
+if(CONFIG_APP_AI_DETECT)
+    list(APPEND srcs "app_ai_detect.cpp")
 endif()
 
 set(requires
@@ -61,6 +71,7 @@ set(requires
     esp_hosted
     bt
     esp_mm        # esp_cache_msync（跨核缓存一致性，2026-10-04）
+    esp_driver_ppa  # YUV420->RGB565（人脸检测送检帧）
     esp_rom       # esp_rom_crc32_le（帧指纹诊断）
 )
 

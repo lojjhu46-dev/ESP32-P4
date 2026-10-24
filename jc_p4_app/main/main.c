@@ -25,6 +25,9 @@
 #include "app_stream.h"
 #include "app_faceai.h"
 #include "app_h264enc.h"
+#include "app_camauto.h"
+#include "app_ai_detect.h"
+#include "app_yuv2rgb.h"
 #include "sdkconfig.h"
 
 static const char *TAG = "main";
@@ -64,13 +67,20 @@ void app_main(void)
     printf("  ESP32-P4 @360MHz + ESP32-C6 (Wi-Fi 6/BLE5)\n");
     printf("  build: %s %s\n", __DATE__, __TIME__);
     printf("==============================================\n");
+    /* 预热 newlib stderr 锁：assert 走 stderr，若等到运行期内部 RAM 碎片化后
+       才第一次初始化该锁，xQueueCreateMutex 失败会先 abort，把真正的 assert
+       信息吞掉（stream off 实测）。这里趁堆干净先建好。 */
+    fprintf(stderr, "stderr lock ready\n");
+    fflush(stderr);
     esp_chip_info_t chip_info = { 0 };
     esp_chip_info(&chip_info);
     ESP_LOGI(TAG, "chip: %s rev%d, flash 16MB, PSRAM 32MB hex@200M",
              CONFIG_IDF_TARGET, chip_info.revision);
 
     nvs_init_safe();
+#if CONFIG_APP_ENABLE_ETH || CONFIG_APP_ENABLE_WIFI
     netif_init_safe();
+#endif
 
     /* 1. shared I2C bus first (display/audio/camera SCCB depend on it) */
     app_i2c_init();
@@ -91,7 +101,11 @@ void app_main(void)
 #endif
 
     /* 4. peripherals; each module updates its own status tile */
+#if CONFIG_APP_ENABLE_SDCARD
     app_sdcard_init();
+#else
+    app_status_set(APP_MOD_SD, true, "disabled");
+#endif
 
 #if CONFIG_APP_ENABLE_ETH
     app_eth_init();
@@ -128,25 +142,46 @@ void app_main(void)
     app_display_set_battery_provider(app_battery_get_percent);
 #endif
 
+    /* 5. image pipe: JPEG 解码引擎要在相机/H.264 启动前初始化（硬件共存时序） */
+#if CONFIG_APP_ENABLE_IMG_PIPE
+    app_imgpipe_init();
+#if CONFIG_APP_CAM_OUT_FMT_YUV420
+    /* 相机已在 ISP 做 HFLIP + 固定 WB，imgpipe 不能再做一次；
+       这些调用会走 USB 日志，必须在 H.264 开始推流前完成。 */
+    app_imgpipe_set_hflip(false);
+    app_imgpipe_set_wb_gain_quiet(1000, 1000);
+    app_imgpipe_select_src(APP_IMG_SRC_CAM);
+#endif
+#else
+    app_status_set(APP_MOD_PIPE, true, "disabled");
+#endif
+
 #if CONFIG_APP_ENABLE_CAMERA
     /* 帧回调必须在 app_camera_init() 之前注册：相机任务一起来就会出帧 */
 #if CONFIG_APP_CAM_OUT_FMT_YUV420
     app_h264enc_register();
+    app_camauto_register();      /* Y 平面 AE：帧回调 + tick，须在相机启动前 */
+#if CONFIG_APP_ENABLE_IMG_PIPE
+    app_yuv2rgb_register();      /* YUV420 → RGB565 → imgpipe（faceai 送帧） */
+#endif
+#if CONFIG_APP_AI_DETECT
+    app_ai_detect_register();    /* 抽帧检测：同样须在相机启动前注册 */
+#endif
 #if !CONFIG_APP_ENABLE_FACEAI
     /* FACEAI 关闭时它不注册命令回调，这里接管最小 stream 命令 */
     app_usb_link_set_cmd_cb(app_h264enc_cmd_cb);
 #endif
 #endif
     app_camera_init();
+#if CONFIG_APP_ENABLE_FACEAI
+    /* 相机/H.264 设备创建完成后再挂 /storage（提前挂载实测会让 H.264 设备创建失败） */
+    app_faceai_storage_init();
+#endif
+#if CONFIG_APP_ENABLE_IMG_PIPE && CONFIG_APP_CAM_OUT_FMT_YUV420
+    app_yuv2rgb_start();         /* 相机就绪后把 imgpipe 源切回 cam 并开始送帧 */
+#endif
 #else
     app_status_set(APP_MOD_CAM, true, "disabled");
-#endif
-
-    /* 5. image pipe: JPEG hw decode -> RGB888 frames (PC link source; app_faceai follows) */
-#if CONFIG_APP_ENABLE_IMG_PIPE
-    app_imgpipe_init();
-#else
-    app_status_set(APP_MOD_PIPE, true, "disabled");
 #endif
 
     /* 5b. image stream: pipeline frame -> hw JPEG -> JCLINK 0x05 (PC/LVGL UI preview) */

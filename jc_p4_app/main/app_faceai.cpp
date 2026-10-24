@@ -37,6 +37,7 @@
 
 #include "app_faceai.h"
 #include "app_imgpipe.h"
+#include "app_h264enc.h"
 #include "app_stream.h"
 #include "app_camera.h"
 #include "app_camauto.h"
@@ -841,6 +842,11 @@ static void send_result(const char *event,
     if (s_ack_cmd) {
         /* 命令回复专用标记：摄像头常驻推流时，host 靠它把 ack 和流式结果区分开 */
         cJSON_AddStringToObject(root, "ack", s_ack_cmd);
+        if (strcmp(s_ack_cmd, "mode") == 0) {
+            /* Qt 识别页直接回填该数值字段（旧版只放在 msg 里） */
+            cJSON_AddNumberToObject(root, "thr_lo", s_thr_lo);
+            cJSON_AddNumberToObject(root, "thr_hi", s_thr_hi);
+        }
     }
     if (s_cam_state_valid) {
         cJSON_AddNumberToObject(root, "gain", s_cam_gain);
@@ -883,6 +889,7 @@ static void send_result(const char *event,
             /* CCM 颜色校正混合比例（千分比，0=模块禁用） */
             cJSON_AddNumberToObject(root, "ccm", s_cam_ccm);
             /* WiFi STA IP（未关联时不带该字段） */
+#if CONFIG_APP_ENABLE_WIFI
             {
                 static char wip[16];
                 if (app_wifi_get_ip(wip, sizeof(wip))) {
@@ -908,6 +915,7 @@ static void send_result(const char *event,
                     cJSON_AddNumberToObject(root, "wrssi", wrssi_cache);
                 }
             }
+#endif
             /* 夜视阶梯（暗度降帧率 + 自动降噪）：night=总开关，ntier=当前档 0/1/2 */
             cJSON_AddNumberToObject(root, "night", s_night_fps ? 1 : 0);
             cJSON_AddNumberToObject(root, "ntier", s_night_tier);
@@ -2181,7 +2189,7 @@ static void db_export_run(void)
         if (app_usb_link_send(JCL_TYPE_BLOB, chunk, n + 4) != ESP_OK) {
             ESP_LOGW(TAG, "dbx: export part %u/%u send failed", (unsigned)(i + 1), (unsigned)parts);
         }
-        vTaskDelay(1);                        /* 让出 CPU：别长时间占住 AI 任务 */
+        vTaskDelay(pdMS_TO_TICKS(20));       /* 分片间留 20ms：USB CDC 突发 16KB 会丢字节 */
     }
 
 out:
@@ -2685,6 +2693,7 @@ static void handle_cmd(const char *json)
         /* {"cmd":"wifi","ssid":"X","pass":"Y"} —— 运行时配置 STA 凭据并连接。
          * 写 NVS（FLASH 存储）断电保存；断线自动重连。ack 只表示已受理，
          * 关联结果看后续结果帧的 got IP / 状态磁贴。 */
+#if CONFIG_APP_ENABLE_WIFI
         const cJSON *jss = cJSON_GetObjectItem(root, "ssid");
         const cJSON *jpw = cJSON_GetObjectItem(root, "pass");
         if (!cJSON_IsString(jss) || !jss->valuestring[0]) {
@@ -2695,6 +2704,9 @@ static void handle_cmd(const char *json)
             snprintf(m, sizeof(m), "wifi connecting to %s (saved)", jss->valuestring);
             send_result("none", nullptr, 0, nullptr, 0, m);
         }
+#else
+        send_result("error", nullptr, 0, nullptr, 0, "wifi disabled in this build");
+#endif
     } else if (strcmp(cmd, "cam") == 0) {
         /* 摄像头参数（夜视测试）：查询 / 设置 / 枚举
          *   {"cmd":"cam"}                                         只查询
@@ -3043,9 +3055,13 @@ static void handle_cmd(const char *json)
     cJSON_Delete(root);
 }
 
-/* 0x03 回调跑在 usb_rx 任务里：只拷进队列，解析放到 AI 任务 */
+/* 0x03 回调跑在 usb_rx 任务里：H.264 专属命令（stream/detect）先截走，
+   其余只拷进队列，解析放到 AI 任务 */
 static void cmd_cb(const char *json, uint32_t len)
 {
+    if (app_h264enc_cmd_try(json, len)) {
+        return;
+    }
     if (!s_cmd_q || len == 0) return;
     cmd_msg_t msg;
     size_t n = len < (CMD_JSON_MAX - 1) ? len : (CMD_JSON_MAX - 1);
@@ -3058,22 +3074,45 @@ static void cmd_cb(const char *json, uint32_t len)
 
 /* ---------------- AI 任务 ---------------- */
 
-static void faceai_task(void *arg)
+/* 早挂载：main 在 app_camera_init() 之前调用，先占住 FAT+WL 的常驻内部 RAM。
+   幂等；失败可由 faceai_task 再试一次。 */
+esp_err_t app_faceai_storage_init(void)
 {
-    (void)arg;
-    app_status_set(APP_MOD_FACE, true, "loading model");
-
-    /* 1. 特征库所在分区 storage(FAT) */
+    if (s_wl != WL_INVALID_HANDLE) {
+        return ESP_OK;
+    }
+    ESP_LOGI(TAG, "storage init: heap int free=%u largest=%u dma_free=%u dma_largest=%u psram=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     esp_vfs_fat_mount_config_t mcfg = {};
     mcfg.format_if_mount_failed = true;
-    mcfg.max_files = 4;
+    mcfg.max_files = 2;
     mcfg.allocation_unit_size = 4096;
     esp_err_t err = esp_vfs_fat_spiflash_mount_rw_wl(FACE_DB_MOUNT, FACE_DB_PART, &mcfg, &s_wl);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "feature db mount failed: %s (detect only)", esp_err_to_name(err));
     } else {
-        ESP_LOGI(TAG, "feature db partition '%s' mounted at %s (first boot formats it, ~few s)",
-                 FACE_DB_PART, FACE_DB_MOUNT);
+        ESP_LOGI(TAG, "feature db partition '%s' mounted at %s (heap int free=%u largest=%u)",
+                 FACE_DB_PART, FACE_DB_MOUNT,
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    }
+    /* ⚠️ 不要在这里 app_usb_link_log：boot 阶段 H.264 已在推流，USB 无人读时
+       发送会长期占住 tx_lock，把 main 卡死。 */
+    return err;
+}
+
+static void faceai_task(void *arg)
+{
+    (void)arg;
+    app_status_set(APP_MOD_FACE, true, "loading model");
+
+    /* 1. 特征库所在分区 storage(FAT)：main 已提前挂载；失败时在这里再试一次 */
+    if (app_faceai_storage_init() != ESP_OK) {
+        app_faceai_storage_init();
     }
 
     /* F9：名表在 storage 挂载之后加载（names.json 优先，NVS 兜底 + 首次开机自动迁移） */
@@ -3100,7 +3139,7 @@ static void faceai_task(void *arg)
 #endif
     float det_thr = s_det_thr;
     s_feat = new HumanFaceFeat(HumanFaceFeat::MFN_S8_V1, false);
-    if (err == ESP_OK) {
+    if (s_wl != WL_INVALID_HANDLE) {
         s_db = new dl::recognition::DataBase(FACE_DB_PATH, s_feat->get_feat_len());
         s_db_ok = true;
         ESP_LOGI(TAG, "feature db %s: %d feat(s) in lib, name table %d", FACE_DB_PATH,
@@ -3109,6 +3148,10 @@ static void faceai_task(void *arg)
     ESP_LOGI(TAG, "models loaded in %d ms (detect=%s thr=%.2f match_thr=%.2f/%.2f lo/hi feat_len=%d)",
              (int)((esp_timer_get_time() - t0) / 1000), detect_model_name(), (double)det_thr,
              (double)s_thr_lo, (double)s_thr_hi, s_feat ? s_feat->get_feat_len() : 0);
+    ESP_LOGI(TAG, "post-models heap: int free=%u largest=%u psram=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
     /* 3. 接管 0x02 应答 + 起循环 */
     app_imgpipe_set_auto_ack(false);
@@ -3170,6 +3213,7 @@ static void faceai_task(void *arg)
         /* 判定类 tick 每轮都跑（含等新帧超时的轮次）：低帧率（夜视档 1~2fps）下
            统计值一帧才更新一次，若只在"拿不到帧就 continue"之后跑，决策会被
            白白多拖一个帧周期（实测升档因此多花约 1 秒） */
+#if !CONFIG_APP_CAM_OUT_FMT_YUV420
         auto_fps_tick();                     /* 运动自适应帧率（AUTO 开启时判定运动） */
         night_tick();                        /* 夜视阶梯：暗度降帧率 + 自动时域降噪 */
         day_expo_tick();                     /* 白天曝光余量阶梯（50->20->10，仅 tier0+AE） */
@@ -3179,6 +3223,7 @@ static void faceai_task(void *arg)
          * （夜视要亮度，且那时人脸识别已门控关闭）。行数换算 1ms = 50 行。 */
         app_camauto_tick(s_cam_fps, s_cam_gain, s_cam_exp_max, s_cam_gain_max,
                          (s_night_tier >= 1) ? 0 : s_ae_exp_cap_ms * 50);
+#endif
         if (!got) {
             /* 夜视模式：2Hz 低频状态帧，让 UI/PC 知道当前模式与参数
                （faces 恒 0、无检测框；识别结果停发，画面帧率看 cam_fps） */
@@ -3210,8 +3255,13 @@ extern "C" esp_err_t app_faceai_init(void)
     /* F9：名表加载已移到 faceai_task 的 storage 挂载之后（names_load）——
        否则 /storage/names.json 挂载前读不到，会误判为"空名表"并从 NVS 覆盖。 */
 
+#if CONFIG_APP_CAM_OUT_FMT_YUV420
+    /* YUV420/H.264：AE 由 app_camauto_register() 的 Y 平面闭环负责，
+       这里不能再 init/再 tick，否则双闭环抢曝光。 */
+#else
     /* AE/AWB 自动引擎（imgpipe 已初始化，可以开统计采样） */
     app_camauto_init();
+#endif
 
     s_cmd_q = xQueueCreate(CMD_QUEUE_LEN, sizeof(cmd_msg_t));
     ESP_RETURN_ON_FALSE(s_cmd_q, ESP_ERR_NO_MEM, TAG, "cmd queue create");

@@ -40,6 +40,7 @@
 #define TAG "camera"
 
 #define CAM_BUF_COUNT     3
+#define CAM_MAX_FRAME_CBS 3
 #define CAM_TASK_STACK    4096
 /* 比 imgpipe/usb(5) 高一级：DQBUF 要按时做，否则 V4L2 三个缓冲满了会整秒取不到帧 */
 #define CAM_TASK_PRIO     6
@@ -59,7 +60,7 @@ static struct {
     uint32_t fourcc;
     volatile bool streaming;
     bool     sensor_hflip;              /* 传感器 HMIRROR 已生效（软件镜像就不用做了） */
-    app_camera_frame_cb_t frame_cb;     /* 帧旁路（H.264 编码），在 QBUF 前同步调用 */
+    app_camera_frame_cb_t frame_cbs[CAM_MAX_FRAME_CBS];  /* 帧旁路，按注册顺序在 QBUF 前调用 */
     uint32_t frames;
     uint32_t dropped;
 } s_cam = { .fd = -1 };
@@ -372,11 +373,13 @@ static void camera_task(void *arg)
             s_cam.frames++;
             win_cnt++;
             /* 旁路必须赶在下面的 QBUF 之前：归还驱动后这块 mmap 缓冲随时会被覆盖 */
-            if (s_cam.frame_cb) {
-                s_cam.frame_cb((const uint8_t *)s_cam.buf[buf.index].start,
-                               s_cam.width, s_cam.height, s_cam.stride, s_cam.fourcc);
+            for (int i = 0; i < CAM_MAX_FRAME_CBS; i++) {
+                if (s_cam.frame_cbs[i]) {
+                    s_cam.frame_cbs[i]((const uint8_t *)s_cam.buf[buf.index].start,
+                                       s_cam.width, s_cam.height, s_cam.stride, s_cam.fourcc);
+                }
             }
-#if CONFIG_APP_ENABLE_IMG_PIPE
+#if CONFIG_APP_ENABLE_IMG_PIPE && !CONFIG_APP_CAM_OUT_FMT_YUV420
             if (app_imgpipe_publish_raw((const uint8_t *)s_cam.buf[buf.index].start,
                                         s_cam.width, s_cam.height, s_cam.stride,
                                         IMG_FMT_RGB565) != ESP_OK) {
@@ -426,7 +429,19 @@ bool app_camera_ready(void)
 
 void app_camera_set_frame_cb(app_camera_frame_cb_t cb)
 {
-    s_cam.frame_cb = cb;
+    s_cam.frame_cbs[0] = cb;
+}
+
+esp_err_t app_camera_add_frame_cb(app_camera_frame_cb_t cb)
+{
+    ESP_RETURN_ON_FALSE(cb, ESP_ERR_INVALID_ARG, TAG, "cb null");
+    for (int i = 0; i < CAM_MAX_FRAME_CBS; i++) {
+        if (!s_cam.frame_cbs[i]) {
+            s_cam.frame_cbs[i] = cb;
+            return ESP_OK;
+        }
+    }
+    return ESP_ERR_NO_MEM;
 }
 
 /* 传感器 HMIRROR 是否已生效（imgpipe 据此跳过软件镜像，省一次全帧内存遍历） */

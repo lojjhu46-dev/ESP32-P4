@@ -32,6 +32,10 @@ extern "C" {
  */
 esp_err_t app_faceai_init(void);
 
+/* 提前挂载 /storage（FAT+WL）：main 在 app_camera_init() 之前调用，先占内部 RAM。
+   幂等；重复调用返回已挂载状态。 */
+esp_err_t app_faceai_storage_init(void);
+
 /* 模型加载完成、开始具备识别能力 */
 bool app_faceai_ready(void);
 

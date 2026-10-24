@@ -224,12 +224,13 @@ class Link:
                 for i, frame in enumerate(frames):
                     # 同一批 read 里 ack 后面常紧跟 0x06 分片；提前 return 会丢掉
                     # 剩余已解析帧（F10 备份实测稳定丢中间 16KB 块）→ 先入队。
+                    # 注意：这里只能给“小帧”入队，但返回必须是 want 里的任意类型
+                    # （0x05 图像 / 0x07 H.264 也走 recv）。
+                    if frame[0] in want:
+                        self._pending.extend(
+                            f for f in frames[i + 1:] if f[0] in (T_RESULT, T_BLOCK))
+                        return frame
                     if frame[0] in (T_RESULT, T_BLOCK):
-                        if frame[0] in want:
-                            self._pending.extend(
-                                f for f in frames[i + 1:] if f[0] in (T_RESULT, T_BLOCK))
-                            return frame
-                        # 只缓存小帧；图像/H.264 帧丢弃，避免排队吃内存
                         self._pending.append(frame)
                         if len(self._pending) > 32:
                             self._pending.pop(0)

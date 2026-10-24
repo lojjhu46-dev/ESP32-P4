@@ -41,6 +41,8 @@
 #include "app_camera.h"
 #include "app_h264enc.h"
 #include "app_usb_link.h"
+#include "app_camauto.h"
+#include "app_ai_detect.h"
 
 #ifndef MAP_FAILED
 #define MAP_FAILED ((void *)-1)
@@ -134,15 +136,18 @@ static struct {
     uint8_t  cfg_gop;
 } s_h = { .fd = -1, .phase = -1 };
 
-/* 抽样 Y 平面均值：M0 无 AE、无落盘时用它确认曝光（≈120 正常，250+ 过曝纯白） */
+/* 抽样 Y 均值（O_UYY_E_VYY 打包布局：每行 u y y / v y y，行字节 = w*3/2） */
 static uint32_t y_plane_mean(const uint8_t *p, int w, int h)
 {
     uint64_t sum = 0;
     uint32_t n = 0;
-    size_t total = (size_t)w * h;
-    for (size_t i = 0; i < total; i += 16) {
-        sum += p[i];
-        n++;
+    const size_t line_bytes = (size_t)w * 3 / 2;
+    for (int y = 0; y < h; y += 8) {
+        const uint8_t *row = p + (size_t)y * line_bytes;
+        for (int pair = 0; pair < w / 2; pair += 4) {
+            sum += row[pair * 3 + 1] + row[pair * 3 + 2];
+            n += 2;
+        }
     }
     return n ? (uint32_t)(sum / n) : 0;
 }
@@ -191,6 +196,8 @@ static void q_drain(void)
 static void sender_task(void *arg)
 {
     (void)arg;
+    /* 预热本任务的 newlib stdio 锁（失败日志在运行期才打，届时堆已碎片化） */
+    ESP_LOGI(TAG, "sender task started");
     h264_pkt_t pkt;
     for (;;) {
         if (xQueueReceive(s_h.q, &pkt, portMAX_DELAY) != pdTRUE) {
@@ -709,10 +716,9 @@ void app_h264enc_on_frame(const uint8_t *data, int w, int h, int stride, uint32_
 
     int64_t now = esp_timer_get_time();
     if (!s_h.enabled) {
-        if (s_h.fd >= 0) {
-            phase_report();
-            enc_close();
-        }
+        /* 停流只暂停送帧：不要 enc_close()。faceai/imgpipe 起来后内部 RAM
+           已放不下编码器的 46KB 参考帧，重开必然失败（实测 fd=-1 后
+           esp_h264_enc_hw_new: No memory for reference frame）。 */
         return;
     }
     if (s_h.cfg_dirty) {
@@ -756,19 +762,28 @@ void app_h264enc_deinit(void)
     s_h.phase = -1;
 }
 
-/* M2 最小命令通道：FACEAI 关闭时由 main 注册。
-   {"cmd":"stream","value":"on|off","bitrate":N,"qp_min":N,"qp_max":N,"i_period":N} */
-void app_h264enc_cmd_cb(const char *json, uint32_t len)
+/* M2 命令通道：FACEAI 构建里由 faceai 的 cmd_cb 先调用 cmd_try 抢走 H.264 专属命令。
+   {"cmd":"stream","value":"on|off","bitrate":N,"qp_min":N,"qp_max":N,"i_period":N}
+   {"cmd":"cam","ae":0|1,"gain":N,"exp":N,"flicker50":0|1,"ae_target":N}  (FACEAI 关闭时)
+   {"cmd":"detect","value":"on|off"} / {"cmd":"ai_dump"}                 (AI_DETECT 时) */
+bool app_h264enc_cmd_try(const char *json, uint32_t len)
 {
     if (!json || len == 0) {
-        return;
+        return false;
     }
     cJSON *root = cJSON_ParseWithLength(json, len);
     if (!root) {
-        return;
+        return false;
     }
     const cJSON *cmd = cJSON_GetObjectItemCaseSensitive(root, "cmd");
     const char *name = cJSON_IsString(cmd) ? cmd->valuestring : "";
+
+    bool handled = false;
+    bool off_ignored = false;
+#if !CONFIG_APP_ENABLE_FACEAI
+    int cam_exp = 0, cam_gain = 0, cam_luma = -1;
+    bool cam_ae = false;
+#endif
 
     if (strcmp(name, "stream") == 0) {
         const cJSON *v = cJSON_GetObjectItemCaseSensitive(root, "value");
@@ -781,9 +796,12 @@ void app_h264enc_cmd_cb(const char *json, uint32_t len)
         if (cJSON_IsString(v)) {
             const bool on = (strcmp(v->valuestring, "on") == 0) ||
                             (strcmp(v->valuestring, "1") == 0);
-            if (s_h.enabled != on) {
-                s_h.enabled = on;
-                s_h.cfg_dirty = true;
+            if (!on) {
+                /* M2 常开固件：off 只回 ack，不停流。停流路径在 faceai 起来后
+                   会触发内部 RAM 碎片化 abort；产品也没有停流入口。 */
+                off_ignored = true;
+            } else if (!s_h.enabled) {
+                s_h.enabled = true;
             }
         }
         if (cJSON_IsNumber(br)) {
@@ -813,22 +831,141 @@ void app_h264enc_cmd_cb(const char *json, uint32_t len)
             }
         }
         portEXIT_CRITICAL(&s_h.cfg_mux);
+        handled = true;
+#if !CONFIG_APP_ENABLE_FACEAI
+    } else if (strcmp(name, "cam") == 0) {
+        const cJSON *jae = cJSON_GetObjectItemCaseSensitive(root, "ae");
+        const cJSON *jg = cJSON_GetObjectItemCaseSensitive(root, "gain");
+        const cJSON *je = cJSON_GetObjectItemCaseSensitive(root, "exp");
+        const cJSON *jf = cJSON_GetObjectItemCaseSensitive(root, "flicker50");
+        const cJSON *jt = cJSON_GetObjectItemCaseSensitive(root, "ae_target");
+
+        if (!app_camauto_get_state(&cam_exp, &cam_gain, &cam_luma, &cam_ae)) {
+            cam_exp = CONFIG_APP_H264_EXP_LINES;
+            cam_gain = CONFIG_APP_CAM_DEF_GAIN;
+        }
+        bool manual = false;
+        if (cJSON_IsNumber(je)) {
+            int e = (int)je->valuedouble;
+            cam_exp = e < 8 ? 8 : (e > 994 ? 994 : e);
+            manual = true;
+        }
+        if (cJSON_IsNumber(jg)) {
+            int g = (int)jg->valuedouble;
+            cam_gain = g < 0 ? 0 : (g > 192 ? 192 : g);
+            manual = true;
+        }
+        if (manual) {
+            app_camera_post_exp_gain(cam_exp, cam_gain);   /* 相机任务信箱 */
+            app_camauto_adopt(cam_exp, cam_gain);
+            app_camauto_note_manual();                     /* 手动参数 -> AE 让位 */
+        }
+        if (cJSON_IsBool(jae)) {
+            cam_ae = cJSON_IsTrue(jae);
+            app_camauto_set_ae(cam_ae);
+        } else if (cJSON_IsNumber(jae)) {
+            cam_ae = jae->valueint != 0;
+            app_camauto_set_ae(cam_ae);
+        }
+        if (cJSON_IsNumber(jf)) {
+            app_camauto_set_flicker50(jf->valueint != 0);
+        }
+        if (cJSON_IsNumber(jt)) {
+            app_camauto_set_target((int)jt->valuedouble);
+        }
+        app_camauto_get_state(&cam_exp, &cam_gain, &cam_luma, &cam_ae);
+        handled = true;
+#endif
+#if CONFIG_APP_AI_DETECT
+    } else if (strcmp(name, "detect") == 0) {
+        const cJSON *v = cJSON_GetObjectItemCaseSensitive(root, "value");
+        bool on = app_ai_detect_enabled();
+        if (cJSON_IsString(v)) {
+            on = (strcmp(v->valuestring, "on") == 0) || (strcmp(v->valuestring, "1") == 0);
+        } else if (cJSON_IsBool(v)) {
+            on = cJSON_IsTrue(v);
+        } else if (cJSON_IsNumber(v)) {
+            on = v->valueint != 0;
+        }
+        app_ai_detect_set_enabled(on);
+        handled = true;
+    } else if (strcmp(name, "ai_dump") == 0) {
+        app_ai_detect_request_dump();
+        handled = true;
+#endif
     }
 
-    /* 任何命令都回 0x02，避免上位机 sendCmdWait 3s 超时 */
+    if (handled) {
+        /* 任何命令都回 0x02，避免上位机 sendCmdWait 3s 超时 */
+        cJSON *ack = cJSON_CreateObject();
+        if (ack) {
+            cJSON_AddStringToObject(ack, "ack", name);
+            if (strcmp(name, "stream") == 0) {
+                cJSON_AddBoolToObject(ack, "value", s_h.enabled);
+                cJSON_AddStringToObject(ack, "fmt", "h264");
+                cJSON_AddNumberToObject(ack, "bitrate", s_h.cfg_bitrate);
+                cJSON_AddNumberToObject(ack, "qp_min", s_h.cfg_qp_min);
+                cJSON_AddNumberToObject(ack, "qp_max", s_h.cfg_qp_max);
+                cJSON_AddNumberToObject(ack, "i_period", s_h.cfg_gop);
+                if (off_ignored) {
+                    cJSON_AddStringToObject(ack, "msg", "stream off ignored (always-on)");
+                }
+#if !CONFIG_APP_ENABLE_FACEAI
+            } else if (strcmp(name, "cam") == 0) {
+                cJSON_AddNumberToObject(ack, "gain", cam_gain);
+                cJSON_AddNumberToObject(ack, "gain_max", 192);
+                cJSON_AddNumberToObject(ack, "exp", cam_exp);
+                cJSON_AddNumberToObject(ack, "exp_max", 994);
+                cJSON_AddNumberToObject(ack, "ae", cam_ae ? 1 : 0);
+                cJSON_AddNumberToObject(ack, "awb", 0);
+                cJSON_AddNumberToObject(ack, "mirror", 1);
+                cJSON_AddNumberToObject(ack, "cam_fps", 50);
+                cJSON_AddNumberToObject(ack, "luma", cam_luma);
+                char m[80];
+                snprintf(m, sizeof(m), "cam ae=%d gain=%d exp=%d luma=%d",
+                         cam_ae ? 1 : 0, cam_gain, cam_exp, cam_luma);
+                cJSON_AddStringToObject(ack, "msg", m);
+#endif
+#if CONFIG_APP_AI_DETECT
+            } else if (strcmp(name, "detect") == 0) {
+                cJSON_AddBoolToObject(ack, "enabled", app_ai_detect_enabled());
+                cJSON_AddNumberToObject(ack, "fps", app_ai_detect_fps());
+            } else if (strcmp(name, "ai_dump") == 0) {
+                cJSON_AddBoolToObject(ack, "queued", true);
+#endif
+            }
+            char *s = cJSON_PrintUnformatted(ack);
+            if (s) {
+                esp_err_t e = app_usb_link_send(JCL_TYPE_RESULT, s, (uint32_t)strlen(s));
+                (void)e;
+                cJSON_free(s);
+            }
+            cJSON_Delete(ack);
+        }
+    }
+    cJSON_Delete(root);
+    return handled;
+}
+
+/* FACEAI 关闭时由 main 注册：未处理的命令仍回 h264-only */
+void app_h264enc_cmd_cb(const char *json, uint32_t len)
+{
+    if (app_h264enc_cmd_try(json, len)) {
+        return;
+    }
+    if (!json || len == 0) {
+        return;
+    }
+    cJSON *root = cJSON_ParseWithLength(json, len);
+    if (!root) {
+        return;
+    }
+    const cJSON *cmd = cJSON_GetObjectItemCaseSensitive(root, "cmd");
+    const char *name = cJSON_IsString(cmd) ? cmd->valuestring : "";
     cJSON *ack = cJSON_CreateObject();
     if (ack) {
         cJSON_AddStringToObject(ack, "ack", name);
-        if (strcmp(name, "stream") == 0) {
-            cJSON_AddBoolToObject(ack, "value", s_h.enabled);
-            cJSON_AddStringToObject(ack, "fmt", "h264");
-            cJSON_AddNumberToObject(ack, "bitrate", s_h.cfg_bitrate);
-            cJSON_AddNumberToObject(ack, "qp_min", s_h.cfg_qp_min);
-            cJSON_AddNumberToObject(ack, "qp_max", s_h.cfg_qp_max);
-            cJSON_AddNumberToObject(ack, "i_period", s_h.cfg_gop);
-        } else {
-            cJSON_AddStringToObject(ack, "msg", "h264-only");
-        }
+        cJSON_AddStringToObject(ack, "msg", "h264-only");
         char *s = cJSON_PrintUnformatted(ack);
         if (s) {
             app_usb_link_send(JCL_TYPE_RESULT, s, (uint32_t)strlen(s));
@@ -863,6 +1000,13 @@ void app_h264enc_cmd_cb(const char *json, uint32_t len)
 {
     (void)json;
     (void)len;
+}
+
+bool app_h264enc_cmd_try(const char *json, uint32_t len)
+{
+    (void)json;
+    (void)len;
+    return false;
 }
 
 #endif /* CONFIG_APP_CAM_OUT_FMT_YUV420 */
