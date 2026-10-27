@@ -90,6 +90,8 @@ private:
     void onPendingTick();
     void pumpImport();
     void dbFinish(bool ok, const QString &msg);
+    void dbArmWatchdog(int idleMs);
+    void dbResetJob();
 
     ITransport      *m_tp = nullptr;
     H264LivePlayer  *m_h264 = nullptr;     /* 0x07 活流解码（随连接创建/销毁） */
@@ -119,6 +121,7 @@ private:
         quint32    expectSize = 0, expectCrc = 0, got = 0;
         int        sentChunks = 0, totalChunks = 0;
         QTimer    *pump = nullptr;
+        QTimer    *watchdog = nullptr;    /* 分片停住即判失败，否则 busy 永久卡死 */
     };
     DbJob m_db;
 

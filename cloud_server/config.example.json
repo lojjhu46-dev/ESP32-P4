@@ -1,0 +1,14 @@
+{
+  "host": "0.0.0.0",
+  "port": 8080,
+  "token": "CHANGE_ME",
+  "cookie_secret": "CHANGE_ME_AT_LEAST_16_CHARS",
+  "data_dir": "/var/lib/facecheck",
+  "dedup_window_s": 1800,
+  "snapshots_keep": 5,
+  "photo_max_bytes": 2097152,
+  "max_body_bytes": 8388608,
+  "photo_keep_days": 90,
+  "session_hours": 12,
+  "max_concurrent": 8
+}

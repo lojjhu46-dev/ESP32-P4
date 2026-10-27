@@ -4,7 +4,8 @@
 #       UTF-8 Chinese text would break parsing (documented in HANDOVER).
 param(
     [switch]$Clean,
-    [switch]$Run
+    [switch]$Run,
+    [switch]$PcTest
 )
 
 $ErrorActionPreference = 'Stop'
@@ -16,7 +17,8 @@ $NinjaDir = Join-Path $QtTools 'Ninja'
 $CMake    = 'C:\Program Files\CMake\bin\cmake.exe'
 
 $SrcDir   = $PSScriptRoot
-$BuildDir = Join-Path $SrcDir 'build'
+# PcTest: 独立 build-pctest（匹配 .gitignore 的 build-*/），生产 build 不动
+$BuildDir = if ($PcTest) { Join-Path $SrcDir 'build-pctest' } else { Join-Path $SrcDir 'build' }
 
 foreach ($p in @($QtRoot, $MingwBin, $NinjaDir, $CMake)) {
     if (-not (Test-Path $p)) { Write-Error "missing path: $p" }
@@ -29,11 +31,13 @@ if ($Clean -and (Test-Path $BuildDir)) { Remove-Item -Recurse -Force $BuildDir }
 
 if (-not (Test-Path (Join-Path $BuildDir 'CMakeCache.txt'))) {
     Write-Host '=== configure ==='
-    & $CMake -S $SrcDir -B $BuildDir -G Ninja `
-        -DCMAKE_BUILD_TYPE=Release `
-        -DCMAKE_PREFIX_PATH="$QtRoot" `
-        -DCMAKE_C_COMPILER="$MingwBin\gcc.exe" `
-        -DCMAKE_CXX_COMPILER="$MingwBin\g++.exe"
+    $CfgArgs = @('-S', $SrcDir, '-B', $BuildDir, '-G', 'Ninja',
+        '-DCMAKE_BUILD_TYPE=Release',
+        "-DCMAKE_PREFIX_PATH=$QtRoot",
+        "-DCMAKE_C_COMPILER=$MingwBin\gcc.exe",
+        "-DCMAKE_CXX_COMPILER=$MingwBin\g++.exe")
+    if ($PcTest) { $CfgArgs += '-DQT_HOST_PC_TEST=ON' }
+    & $CMake @CfgArgs
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 

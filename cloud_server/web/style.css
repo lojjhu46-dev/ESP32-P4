@@ -1,0 +1,126 @@
+:root {
+  --bg: #14161a;
+  --panel: #1c1f26;
+  --panel2: #22262f;
+  --line: #2a303a;
+  --text: #e6eaf0;
+  --muted: #8a93a3;
+  --accent: #35c2e8;
+  --accent2: #1e88a8;
+  --danger: #ff5c5c;
+  --ok: #3ddc84;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.5 "Microsoft YaHei UI", "PingFang SC", "Noto Sans CJK SC", sans-serif;
+}
+.hidden { display: none !important; }
+.muted { color: var(--muted); }
+.err { color: var(--danger); min-height: 20px; margin-top: 8px; }
+.hint { color: var(--muted); font-size: 12px; margin: 10px 2px 24px; }
+
+/* login */
+.login {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+.login form {
+  width: min(380px, 100%);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 28px;
+}
+.login h1 { font-size: 20px; margin: 0 0 6px; }
+.login h1 span, .brand span { color: var(--accent); font-weight: 400; }
+
+input, button, .button {
+  font: inherit;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 7px 10px;
+}
+input:focus { outline: none; border-color: var(--accent); }
+input[type="datetime-local"] { color-scheme: dark; }
+.login input { width: 100%; margin: 14px 0 12px; }
+button, .button { cursor: pointer; text-decoration: none; display: inline-block; }
+button:hover, .button:hover { background: var(--panel2); border-color: #38404c; }
+button.primary { background: var(--accent2); border-color: var(--accent); font-weight: 600; }
+button.primary:hover { background: #2499bc; }
+button.ghost { background: transparent; }
+button:disabled { color: #5a6270; border-color: #22262f; cursor: default; }
+
+/* header */
+header {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 12px 20px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+  position: sticky;
+  top: 0;
+  z-index: 5;
+}
+.brand { font-weight: 700; font-size: 16px; white-space: nowrap; }
+nav { display: flex; gap: 4px; flex: 1; overflow-x: auto; }
+nav button {
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--muted);
+  padding: 7px 14px;
+  white-space: nowrap;
+}
+nav button.active { color: var(--accent); border-color: var(--line); background: var(--panel2); }
+
+main { padding: 16px 20px 40px; max-width: 1500px; margin: 0 auto; }
+.toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
+.toolbar label { display: flex; align-items: center; gap: 6px; color: var(--muted); }
+.toolbar input { min-width: 130px; }
+.file { position: relative; overflow: hidden; cursor: pointer; border: 1px solid var(--line); border-radius: 4px; padding: 7px 10px; color: var(--text); }
+.file input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
+.meta-row { margin: 4px 0 10px; }
+
+.table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); }
+table { width: 100%; border-collapse: collapse; min-width: 680px; }
+th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th { color: var(--muted); font-weight: 500; background: var(--panel2); position: sticky; top: 0; }
+tbody tr:last-child td { border-bottom: none; }
+tbody tr:hover { background: #191c22; }
+td .tag { font-size: 11px; color: var(--danger); border: 1px solid #7a2e2e; border-radius: 3px; padding: 1px 5px; margin-left: 6px; }
+td .ok { color: var(--ok); }
+
+.pager { display: flex; align-items: center; gap: 12px; justify-content: flex-end; margin-top: 10px; }
+
+/* modal */
+.modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, .72);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  z-index: 20;
+}
+.modal-box { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; max-width: 90vw; max-height: 92vh; }
+.modal-box img { display: block; max-width: min(860px, 86vw); max-height: 76vh; border-radius: 4px; background: #000; }
+.modal-actions { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-top: 10px; }
+
+@media (max-width: 720px) {
+  header { flex-wrap: wrap; padding: 10px 12px; }
+  nav { order: 3; width: 100%; }
+  main { padding: 12px; }
+  .toolbar input { min-width: 0; width: 100%; }
+  .toolbar label { width: 100%; }
+  .toolbar label input { flex: 1; }
+}

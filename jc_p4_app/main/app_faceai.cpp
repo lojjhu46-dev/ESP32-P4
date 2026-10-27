@@ -102,7 +102,8 @@
 
 #define FACE_DB_MOUNT   "/storage"
 #define FACE_DB_PART    "storage"
-#define FACE_DB_PATH    "/storage/face.db"
+/* 运行期库路径（testlib 可切 /storage/ftest.*）；变量定义见 globals */
+#define FACE_DB_PATH    s_db_path
 #define FACE_NVS_NS     "faceai"
 #define FACE_NVS_KEY    "names"
 
@@ -206,6 +207,17 @@ wl_handle_t      s_wl = WL_INVALID_HANDLE;
 QueueHandle_t    s_cmd_q = nullptr;
 bool             s_db_ok = false;
 
+/* 运行期库路径：默认生产；测试构建可用 testlib 切到 ftest.*（不持久化，重启回生产）。
+   下面的宏（FACE_DB_PATH / FACE_NAMES_PATH / DBX_*）都是这些变量的别名。 */
+static char      s_db_path[48] = "/storage/face.db";
+static char      s_names_path[48] = "/storage/names.json";
+static char      s_names_tmp[48] = "/storage/names.tmp";
+static char      s_dbx_face_tmp[48] = "/storage/face_new.db";
+static char      s_dbx_face_bak[48] = "/storage/face_bak.db";
+static char      s_dbx_names_bak[48] = "/storage/names.bak";
+static char      s_dbx_recv_path[48] = "/storage/dbx_recv.bin";
+static bool      s_test_lib = false;      /* true = 当前使用测试库 */
+
 face_name_t      s_names[MAX_FEATS];
 int              s_name_cnt = 0;        /* 特征条数（一个名字可能多条） */
 
@@ -225,6 +237,10 @@ char             s_reg_name[32] = { 0 };
 int              s_reg_shots = 0;       /* 目标采集帧数 */
 int              s_reg_got = 0;         /* 已入库帧数 */
 int64_t          s_reg_last_us = 0;     /* 上一帧采集时刻（帧间隔拉开用） */
+/* 本次注册会话已落库的 id：会话被打断时按它回滚，否则留下无名孤儿特征 */
+uint16_t         s_reg_ids[FACE_ENROLL_MAX_SHOTS] = { 0 };
+int              s_reg_id_cnt = 0;
+
 /* F2 时域平滑：最近 K 帧 top-1 结果环形缓冲（人脸离开即清空） */
 struct smooth_rec_t { uint16_t id; float sim; };
 smooth_rec_t     s_smooth[FACE_SMOOTH_K];
@@ -430,12 +446,17 @@ static const char *name_find_name(uint16_t id)
     return nullptr;
 }
 
-/* 追加一条特征->名字（可重复名字，表示同一个人多张特征） */
+/* 追加一条特征->名字（可重复名字，表示同一个人多张特征）。
+ * 槽位已属于别人时拒绝：id 一旦被顶掉，那个人就再也识别不出来了 */
 static bool name_add(uint16_t id, const char *name)
 {
     for (int i = 0; i < s_name_cnt; i++) {
         if (s_names[i].id == id) {
-            strlcpy(s_names[i].name, name, sizeof(s_names[i].name));
+            if (strcmp(s_names[i].name, name) != 0) {
+                ESP_LOGE(TAG, "name_add: id %u already owned by '%s', refuse to rebind as '%s'",
+                         (unsigned)id, s_names[i].name, name);
+                return false;
+            }
             return true;
         }
     }
@@ -510,11 +531,85 @@ static int name_remove_by_name(const char *name)
     return removed;
 }
 
+/* 删掉一条名字记录（按 id），注册回滚用 */
+static void name_remove_by_id(uint16_t id)
+{
+    for (int i = 0; i < s_name_cnt;) {
+        if (s_names[i].id == id) {
+            for (int j = i; j < s_name_cnt - 1; j++) s_names[j] = s_names[j + 1];
+            s_name_cnt--;
+        } else {
+            i++;
+        }
+    }
+}
+
+/* 回滚本次注册会话已入库的特征：注册没采满就走开，会留下没有名字的槽位，
+   它们照样参与 1:N 匹配（结果只能是 unknown）并白占空间 */
+static void reg_rollback(void)
+{
+    if (s_reg_id_cnt == 0) return;
+    int dropped = 0;
+    for (int i = 0; i < s_reg_id_cnt; i++) {
+        const uint16_t id = s_reg_ids[i];
+        if (!id) continue;
+        if (s_db_ok && s_db && s_db->delete_feat(id) == ESP_OK) {
+            name_remove_by_id(id);
+            dropped++;
+        }
+    }
+    ESP_LOGW(TAG, "register rolled back: dropped %d/%d unnamed feat(s) of '%s'",
+             dropped, s_reg_id_cnt, s_reg_name);
+    s_reg_id_cnt = 0;
+    if (dropped) s_lib_dirty = true;
+}
+
+/* 回收"有特征、没名字"的孤儿槽位（历史遗留 + 掉电在 names_save 之前造成）。
+   face.db 布局：6 B 头(u16 total|u16 valid|u16 feat_len) + total * (u16 id + feat_len*f32)，
+   槽位按位置寻址、id 永不复用，所以第 i 槽的 id 要么是 i+1 要么是 0（空洞）。 */
+static int lib_gc_orphans(const char *why)
+{
+    if (!s_db_ok || !s_db || s_name_cnt == 0) return 0;
+    static uint16_t s_gc_ids[MAX_FEATS];      /* 先读完再删：别和 delete_feat 交叉读写 */
+    FILE *f = fopen(s_db_path, "rb");
+    if (!f) {
+        ESP_LOGW(TAG, "gc(%s): open %s failed", why, s_db_path);
+        return 0;
+    }
+    uint16_t hdr[3] = { 0 };
+    int found = 0;
+    if (fread(hdr, sizeof(hdr), 1, f) == 1 && hdr[2] > 0 && hdr[0] <= MAX_FEATS) {
+        const uint16_t total = hdr[0];
+        const size_t rec = sizeof(uint16_t) + (size_t)hdr[2] * sizeof(float);
+        for (uint16_t i = 0; i < total; i++) {
+            uint16_t id = 0;
+            if (fseek(f, (long)(sizeof(hdr) + (size_t)i * rec), SEEK_SET) != 0 ||
+                fread(&id, sizeof(id), 1, f) != 1) {
+                break;
+            }
+            if (id != 0 && name_find_name(id) == nullptr) {
+                s_gc_ids[found++] = id;
+            }
+        }
+    }
+    fclose(f);
+    int dropped = 0;
+    for (int i = 0; i < found; i++) {
+        if (s_db->delete_feat(s_gc_ids[i]) == ESP_OK) dropped++;
+    }
+    if (dropped) {
+        s_lib_dirty = true;
+        ESP_LOGW(TAG, "gc(%s): dropped %d orphan feat(s) without name, lib now %d",
+                 why, dropped, s_db->get_num_feats());
+    }
+    return dropped;
+}
+
 /* F9（2026-10-11）：名表主存储 /storage/names.json（cJSON 数组 [{id,name}...]），
  * NVS(faceai/names) 旧格式字符串仅作只读兜底；首次开机 names.json 缺失时从 NVS
  * 自动迁移。文件无 NVS 单值长度限制，人数上限因此可从 10 提到 64+。 */
-#define FACE_NAMES_PATH "/storage/names.json"
-#define FACE_NAMES_TMP  "/storage/names.tmp"
+#define FACE_NAMES_PATH s_names_path
+#define FACE_NAMES_TMP  s_names_tmp
 
 /* F10（2026-10-11）：特征库备份/恢复的文件与信封常量。
    ⚠️ 文件名一律 8.3 安全（F9 教训：FATFS 未开 LFN 时 4 字符扩展名会静默失败）。
@@ -524,10 +619,10 @@ static int name_remove_by_name(const char *name)
 #define DBX_VER        1U
 #define DBX_HDR_LEN    16U                          /* magic|ver|face_len|names_len */
 #define DBX_MAX_BYTES  (2U * 1024 * 1024)           /* 信封总长上限（拒绝超限）*/
-#define DBX_FACE_TMP   "/storage/face_new.db"
-#define DBX_FACE_BAK   "/storage/face_bak.db"
-#define DBX_NAMES_BAK  "/storage/names.bak"
-#define DBX_RECV_PATH  "/storage/dbx_recv.bin"      /* 导入接收文件（存在 = 会话进行中）*/
+#define DBX_FACE_TMP   s_dbx_face_tmp
+#define DBX_FACE_BAK   s_dbx_face_bak
+#define DBX_NAMES_BAK  s_dbx_names_bak
+#define DBX_RECV_PATH  s_dbx_recv_path     /* 导入接收文件（存在 = 会话进行中）*/
 
 /* 读整个文件到 malloc 缓冲（末尾补 '\0'，*len_out 为真实字节数）；失败返回 NULL */
 static uint8_t *read_file_all(const char *path, size_t *len_out)
@@ -731,15 +826,26 @@ static void names_save_nvs(void)
 static void names_save(void)
 {
     if (!names_save_json()) {
-        ESP_LOGW(TAG, "names.json write failed (fallback NVS only)");
+        ESP_LOGW(TAG, "names.json write failed");
     }
-    names_save_nvs();
+    /* 测试库只写 ftest.json，绝不碰生产的 NVS 兜底 */
+    if (!s_test_lib) {
+        names_save_nvs();
+    }
 }
 
 /* 名表加载（⚠️ 必须在 storage 挂载之后调用）：names.json 优先；缺失则从 NVS 迁移 */
 static void names_load(void)
 {
     s_name_cnt = 0;
+    if (s_test_lib) {
+        if (names_load_json()) {
+            ESP_LOGI(TAG, "test names loaded from %s: %d", FACE_NAMES_PATH, s_name_cnt);
+        } else {
+            ESP_LOGI(TAG, "test names empty (%s)", FACE_NAMES_PATH);
+        }
+        return;
+    }
     if (names_load_json()) {
         ESP_LOGI(TAG, "names loaded from %s: %d", FACE_NAMES_PATH, s_name_cnt);
         return;
@@ -835,6 +941,12 @@ static void send_result(const char *event,
     cJSON_AddNumberToObject(root, "infer_ms", (int)infer_ms);
     cJSON_AddNumberToObject(root, "lib_n", s_name_cnt);
     cJSON_AddNumberToObject(root, "dropped", (int)s_drops);
+#if CONFIG_APP_FACEAI_PC_TEST
+    /* 测试构建能力位：Qt/脚本据此判断能否进 PC 测试库 */
+    cJSON_AddNumberToObject(root, "pctest", 1);
+    cJSON_AddNumberToObject(root, "testlib", s_test_lib ? 1 : 0);
+    cJSON_AddStringToObject(root, "db", s_db_path);
+#endif
     cJSON_AddStringToObject(root, "event", event);
     cJSON_AddStringToObject(root, "src", app_imgpipe_src_str(app_imgpipe_get_src()));
     /* 2026-10-16：当前生效的发送链路（"usb-cdc" / "tcp"），上位机用它显示链路徽标 */
@@ -1345,14 +1457,19 @@ static void handle_frame(const img_frame_t &fr)
             } else {
                 dl::TensorBase *f = feat_run(img, big->keypoint);
                 if (f && s_db->enroll_feat(f) == ESP_OK) {
-                    /* 刚入库的特征与自身相似度=1.0，用它取回新分配的 id */
-                    std::vector<dl::recognition::result_t> q = s_db->query_feat(f, 0.999f, 1);
-                    uint16_t id = q.empty() ? 0 : q.front().id;
+                    /* enroll_feat 只追加、id 永不复用，直接问它新槽号。
+                       早先用 query_feat(0.999) 反查会命中同一个人的旧特征，
+                       把名字绑到别人的槽上（2026-10-26 实测把 personB 顶成了 personA） */
+                    uint16_t id = s_db->last_enrolled_id();
                     if (id && name_add(id, s_reg_name)) {
+                        if (s_reg_id_cnt < FACE_ENROLL_MAX_SHOTS) {
+                            s_reg_ids[s_reg_id_cnt++] = id;
+                        }
                         s_reg_got++;
                         s_reg_last_us = fr.ts_us;
                         if (s_reg_got >= s_reg_shots) {
                             names_save();
+                            s_reg_id_cnt = 0;   /* 会话已落盘，回滚不再适用 */
                             match_name = s_reg_name;    /* 结果里带上刚注册的名字，host 可核对 */
                             event = "registered";
                             s_lib_dirty = true;
@@ -1372,9 +1489,10 @@ static void handle_frame(const img_frame_t &fr)
                         }
                     } else {
                         event = "error";
-                        msg = "lib full";
+                        msg = id ? "id busy" : "lib full";
                         s_reg_pending = false;
                         s_reg_shots = 0;
+                        reg_rollback();
                     }
                 } else {
                     event = "error";
@@ -2338,6 +2456,9 @@ static void db_import_end(void)
     }
     s_db = new dl::recognition::DataBase(FACE_DB_PATH, s_feat ? s_feat->get_feat_len() : 512);
     s_db_ok = (s_db != nullptr);
+    s_reg_pending = false;
+    s_reg_id_cnt = 0;
+    lib_gc_orphans("dbx");
 
     /* 复位识别侧缓存（同 clear/delete 的清单一套） */
     smooth_reset();
@@ -2363,6 +2484,103 @@ static void db_import_abort(void)
     remove(DBX_RECV_PATH);
     send_result("none", nullptr, 0, nullptr, 0, "db_import aborted, library unchanged");
 }
+
+#if CONFIG_APP_FACEAI_PC_TEST
+/* 测试库切换：on = /storage/ftest.*，off = 生产 face.db/names.json。
+   - 不持久化，重启回生产；测试名表只读写 ftest.json，不碰 NVS。
+   - 任一步失败回滚到切换前的库；FAT max_files=2，必须先 delete 旧 DataBase。 */
+static bool testlib_set(bool on, bool reset)
+{
+    if (s_wl == WL_INVALID_HANDLE || !s_feat) {
+        ESP_LOGW(TAG, "testlib: storage/feature engine unavailable");
+        return false;
+    }
+
+    char old_db[48], old_names[48], old_ntmp[48], old_ftmp[48], old_fbak[48], old_nbak[48],
+        old_recv[48];
+    strlcpy(old_db, s_db_path, sizeof(old_db));
+    strlcpy(old_names, s_names_path, sizeof(old_names));
+    strlcpy(old_ntmp, s_names_tmp, sizeof(old_ntmp));
+    strlcpy(old_ftmp, s_dbx_face_tmp, sizeof(old_ftmp));
+    strlcpy(old_fbak, s_dbx_face_bak, sizeof(old_fbak));
+    strlcpy(old_nbak, s_dbx_names_bak, sizeof(old_nbak));
+    strlcpy(old_recv, s_dbx_recv_path, sizeof(old_recv));
+    const bool old_test = s_test_lib;
+
+    if (on && reset) {
+        remove("/storage/ftest.db");
+        remove("/storage/ftest.json");
+        remove("/storage/ftest.tmp");
+        remove("/storage/ftnew.db");
+        remove("/storage/ftbak.db");
+        remove("/storage/ftbak.bak");
+        remove("/storage/ftx.bin");
+    }
+
+    if (s_db) {
+        delete s_db;
+        s_db = nullptr;
+    }
+    s_db_ok = false;
+
+    if (on) {
+        strlcpy(s_db_path, "/storage/ftest.db", sizeof(s_db_path));
+        strlcpy(s_names_path, "/storage/ftest.json", sizeof(s_names_path));
+        strlcpy(s_names_tmp, "/storage/ftest.tmp", sizeof(s_names_tmp));
+        strlcpy(s_dbx_face_tmp, "/storage/ftnew.db", sizeof(s_dbx_face_tmp));
+        strlcpy(s_dbx_face_bak, "/storage/ftbak.db", sizeof(s_dbx_face_bak));
+        strlcpy(s_dbx_names_bak, "/storage/ftbak.bak", sizeof(s_dbx_names_bak));
+        strlcpy(s_dbx_recv_path, "/storage/ftx.bin", sizeof(s_dbx_recv_path));
+    } else {
+        strlcpy(s_db_path, "/storage/face.db", sizeof(s_db_path));
+        strlcpy(s_names_path, "/storage/names.json", sizeof(s_names_path));
+        strlcpy(s_names_tmp, "/storage/names.tmp", sizeof(s_names_tmp));
+        strlcpy(s_dbx_face_tmp, "/storage/face_new.db", sizeof(s_dbx_face_tmp));
+        strlcpy(s_dbx_face_bak, "/storage/face_bak.db", sizeof(s_dbx_face_bak));
+        strlcpy(s_dbx_names_bak, "/storage/names.bak", sizeof(s_dbx_names_bak));
+        strlcpy(s_dbx_recv_path, "/storage/dbx_recv.bin", sizeof(s_dbx_recv_path));
+    }
+    s_test_lib = on;
+    names_load();
+
+    s_db = new dl::recognition::DataBase(s_db_path, s_feat->get_feat_len());
+    s_db_ok = (s_db != nullptr);
+    if (!s_db_ok) {
+        ESP_LOGE(TAG, "testlib: open %s failed, rolling back", s_db_path);
+        if (s_db) {
+            delete s_db;
+            s_db = nullptr;
+        }
+        strlcpy(s_db_path, old_db, sizeof(s_db_path));
+        strlcpy(s_names_path, old_names, sizeof(s_names_path));
+        strlcpy(s_names_tmp, old_ntmp, sizeof(s_names_tmp));
+        strlcpy(s_dbx_face_tmp, old_ftmp, sizeof(s_dbx_face_tmp));
+        strlcpy(s_dbx_face_bak, old_fbak, sizeof(s_dbx_face_bak));
+        strlcpy(s_dbx_names_bak, old_nbak, sizeof(s_dbx_names_bak));
+        strlcpy(s_dbx_recv_path, old_recv, sizeof(s_dbx_recv_path));
+        s_test_lib = old_test;
+        names_load();
+        s_db = new dl::recognition::DataBase(s_db_path, s_feat->get_feat_len());
+        s_db_ok = (s_db != nullptr);
+        return false;
+    }
+
+    smooth_reset();
+    s_trk_ok = false;
+    s_evt_match_name[0] = 0;
+    s_evt_match_us = 0;
+    s_evt_rej_us = 0;
+    s_multi_cache_n = 0;
+    s_reg_pending = false;
+    s_reg_shots = 0;
+    s_reg_id_cnt = 0;
+    lib_gc_orphans(on ? "testlib-on" : "testlib-off");
+    s_lib_dirty = true;
+    ESP_LOGW(TAG, "testlib -> %s (%s, %d feat(s))", on ? "on" : "off", s_db_path,
+             s_db ? s_db->get_num_feats() : 0);
+    return true;
+}
+#endif
 
 static void handle_cmd(const char *json)
 {
@@ -2534,6 +2752,10 @@ static void handle_cmd(const char *json)
                 int shots = cJSON_IsNumber(jshots) ? jshots->valueint : 1;
                 if (shots < 1) shots = 1;
                 if (shots > FACE_ENROLL_MAX_SHOTS) shots = FACE_ENROLL_MAX_SHOTS;
+                if (s_reg_pending) {
+                    reg_rollback();         /* 上一轮没采完：先撤掉它的无名特征 */
+                }
+                s_reg_id_cnt = 0;
                 strlcpy(s_reg_name, name, sizeof(s_reg_name));
                 s_reg_arm_us = esp_timer_get_time();
                 s_reg_pending = true;
@@ -2592,7 +2814,15 @@ static void handle_cmd(const char *json)
         if (!strcmp(v, "cam") || !strcmp(v, "camera")) {
             app_imgpipe_select_src(APP_IMG_SRC_CAM);
         } else if (!strcmp(v, "pc") || !strcmp(v, "usb")) {
+#if CONFIG_APP_FACEAI_PC_TEST
             app_imgpipe_select_src(APP_IMG_SRC_PC);
+#else
+            send_result("error", nullptr, 0, nullptr, 0,
+                        "PC source disabled in this build");
+            s_ack_cmd = nullptr;
+            cJSON_Delete(root);
+            return;
+#endif
         } else {
             send_result("error", nullptr, 0, nullptr, 0, "src must be cam|pc");
             s_ack_cmd = nullptr;
@@ -3039,6 +3269,36 @@ static void handle_cmd(const char *json)
         s_reg_pending = false;                  /* 清库同时取消未完成的注册采集 */
         s_reg_shots = 0;
         send_result("deleted", nullptr, 0, nullptr, 0, "cleared");
+#if CONFIG_APP_FACEAI_PC_TEST
+    } else if (strcmp(cmd, "testlib") == 0) {
+        const cJSON *jv = cJSON_GetObjectItem(root, "value");
+        if (!cJSON_IsString(jv)) jv = cJSON_GetObjectItem(root, "action");
+        const char *v = cJSON_IsString(jv) ? jv->valuestring : "status";
+        const cJSON *jr = cJSON_GetObjectItem(root, "reset");
+        const bool reset = cJSON_IsTrue(jr);
+        if (!v[0] || !strcmp(v, "status")) {
+            char msg[160];
+            snprintf(msg, sizeof(msg), "testlib=%s db=%s lib=%d feats=%d",
+                     s_test_lib ? "on" : "off", s_db_path, s_name_cnt,
+                     s_db ? s_db->get_num_feats() : 0);
+            send_result("none", nullptr, 0, nullptr, 0, msg);
+        } else if (!strcmp(v, "on") || !strcmp(v, "off")) {
+            const bool on = !strcmp(v, "on");
+            if (testlib_set(on, reset)) {
+                char msg[160];
+                snprintf(msg, sizeof(msg), "testlib=%s db=%s lib=%d feats=%d",
+                         s_test_lib ? "on" : "off", s_db_path, s_name_cnt,
+                         s_db ? s_db->get_num_feats() : 0);
+                send_result("none", nullptr, 0, nullptr, 0, msg);
+            } else {
+                send_result("error", nullptr, 0, nullptr, 0,
+                            "testlib switch failed (rolled back)");
+            }
+        } else {
+            send_result("error", nullptr, 0, nullptr, 0,
+                        "testlib value must be on|off|status");
+        }
+#endif
     } else if (strcmp(cmd, "db_export") == 0) {
         db_export_run();                       /* F10：导出名表 + face.db */
     } else if (strcmp(cmd, "db_import") == 0) {
@@ -3144,6 +3404,7 @@ static void faceai_task(void *arg)
         s_db_ok = true;
         ESP_LOGI(TAG, "feature db %s: %d feat(s) in lib, name table %d", FACE_DB_PATH,
                  s_db->get_num_feats(), s_name_cnt);
+        lib_gc_orphans("boot");
     }
     ESP_LOGI(TAG, "models loaded in %d ms (detect=%s thr=%.2f match_thr=%.2f/%.2f lo/hi feat_len=%d)",
              (int)((esp_timer_get_time() - t0) / 1000), detect_model_name(), (double)det_thr,

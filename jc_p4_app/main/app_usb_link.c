@@ -196,7 +196,9 @@ static void parser_feed(uint8_t b)
             } else if (s_lk.f_type == JCL_TYPE_BLOB && s_lk.blob_cb) {
                 /* F10：块数据回调（rx 任务上下文，payload 返回后即释放） */
                 s_lk.blob_cb(s_lk.f_buf, s_lk.f_len);
-            } else if (s_lk.f_type == JCL_TYPE_JPEG) {
+            }
+#if CONFIG_APP_FACEAI_PC_TEST
+            else if (s_lk.f_type == JCL_TYPE_JPEG) {
                 if (s_lk.jpeg_buf) heap_caps_free(s_lk.jpeg_buf);
                 s_lk.jpeg_buf = s_lk.f_buf;
                 s_lk.jpeg_len = s_lk.f_len;
@@ -204,6 +206,7 @@ static void parser_feed(uint8_t b)
                 s_lk.f_buf = NULL;         /* ownership moved */
                 xSemaphoreGive(s_lk.jpeg_sem);
             }
+#endif
         } else {
             ESP_LOGW(TAG, "crc mismatch type=%u len=%u", s_lk.f_type, (unsigned)s_lk.f_len);
             s_lk.dropped++;

@@ -6,9 +6,13 @@
  *   顶：接口选择（TCP / USB）+ 连接 + 链路徽标 + 流开关 + 截图 + 缩放
  *   底：状态栏（链路 / 流量 / 帧率 / 丢帧 / 板端日志）
  */
+#include <QHash>
+#include <QImage>
+#include <QJsonArray>
 #include <QJsonObject>
 #include <QMainWindow>
 
+class CloudClient;
 class LinkSession;
 class VideoView;
 
@@ -42,6 +46,13 @@ private:
     QWidget *buildRecognizeTab();
     QWidget *buildCameraTab();
     QWidget *buildBackupTab();
+    QWidget *buildCloudTab();
+
+    void applyCloudConfig(bool quiet = false);
+    void onCloudMatch(const QJsonObject &obj);
+    QByteArray cropFaceJpeg(const QString &name) const;
+    void pushFacebank(bool autoSync);
+    void pullFacebank();
 
     void refreshPorts();
     void updateIfaceWidgets();
@@ -115,6 +126,7 @@ private:
     QComboBox *m_camFpsBox = nullptr;
     QComboBox *m_dnBox = nullptr;
     QCheckBox *m_mirrorChk = nullptr;
+    QCheckBox *m_vflipChk = nullptr;
     QCheckBox *m_aeChk = nullptr;
     QCheckBox *m_awbChk = nullptr;
     QCheckBox *m_nightChk = nullptr;
@@ -125,6 +137,32 @@ private:
     QPushButton *m_importBtn = nullptr;
     QProgressBar *m_dbBar = nullptr;
     QLabel *m_dbLabel = nullptr;
+
+    /* 云签到 */
+    CloudClient *m_cloud = nullptr;
+    QCheckBox   *m_cloudOn = nullptr;
+    QLineEdit   *m_cloudUrl = nullptr;
+    QLineEdit   *m_cloudToken = nullptr;
+    QLineEdit   *m_cloudDevice = nullptr;
+    QCheckBox   *m_cloudPhoto = nullptr;
+    QCheckBox   *m_cloudAutoSync = nullptr;
+    QLabel      *m_cloudState = nullptr;
+    QPushButton *m_cloudTestBtn = nullptr;
+    QPushButton *m_cloudPushBtn = nullptr;
+    QPushButton *m_cloudPullBtn = nullptr;
+    QLabel      *m_cloudLast = nullptr;
+    QImage       m_lastFrame;
+    QJsonArray   m_lastBoxes;
+    qint64       m_lastFrameMs = 0;
+    qint64       m_lastBoxesMs = 0;
+    QHash<QString, qint64> m_cloudSeen;
+    bool         m_dbAutoUp = false;
+    bool         m_dbUploadAfterExport = false;
+    bool         m_pcTestMode = false;      /* PC 测试页激活时阻断生产云上报 */
+    QString      m_dbSyncPath;
+    QString      m_cloudImportPath;
+    int          m_lastLibN = 0;
+    int          m_cloudHeartbeatFailures = 0;
 
     QPlainTextEdit *m_logView = nullptr;
 

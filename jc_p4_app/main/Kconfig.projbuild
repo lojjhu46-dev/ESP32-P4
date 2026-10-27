@@ -233,6 +233,19 @@ menu "JC P4 App Configuration"
             (src=pc) are never gated. Runtime override:
             {"cmd":"cam","face_night":true|false}.
 
+    config APP_FACEAI_PC_TEST
+        bool "Enable PC image test mode (0x01/src=pc + /storage/ftest.*)"
+        default n
+        depends on APP_ENABLE_FACEAI && APP_ENABLE_IMG_PIPE
+        help
+            Test build only. Enables the PC JPEG source (0x01 + src=pc), the
+            testlib command and the isolated test library /storage/ftest.db +
+            ftest.json (runtime switched, never persisted; reboot returns to
+            the production face.db). Production builds leave this off: the PC
+            source and test library are compiled out; src=pc is rejected and
+            0x01 frames are dropped. The 25/25 PC-source regression requires a
+            test build. Changing this option requires idf.py reconfigure.
+
     config APP_ENABLE_WIFI
         bool "Enable Wi-Fi via ESP32-C6 (ESP-Hosted)"
         default y

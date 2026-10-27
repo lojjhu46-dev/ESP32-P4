@@ -166,7 +166,11 @@ static frame_source_t s_usb_src = {
 
 frame_source_t *app_imgpipe_usb_source(void)
 {
+#if CONFIG_APP_FACEAI_PC_TEST
     return &s_usb_src;
+#else
+    return NULL;        /* 生产构建：不提供 PC 图像源 */
+#endif
 }
 
 /* ---------------- 帧池 ---------------- */
@@ -944,6 +948,12 @@ bool app_imgpipe_get_pub_demand(void)
 
 void app_imgpipe_select_src(app_img_src_t src)
 {
+#if !CONFIG_APP_FACEAI_PC_TEST
+    if (src != APP_IMG_SRC_CAM) {
+        ESP_LOGW(TAG, "PC source disabled in this build");
+        return;
+    }
+#endif
     if (s_pipe.src_mode == src) {
         return;
     }
@@ -1238,6 +1248,7 @@ esp_err_t app_imgpipe_init(void)
     s_pipe.dn = CONFIG_APP_CAM_DN;         /* 时域降噪档（0=关，运行时可用 cam 命令改） */
     s_pipe.mv_thr = CONFIG_APP_CAM_MOTION_THR;   /* 运动估计阈值（自动帧率模式下用） */
     s_pipe.fps_win = esp_timer_get_time();
+#if CONFIG_APP_FACEAI_PC_TEST
     s_pipe.rx_buf = heap_caps_malloc(PIPE_RX_BUF, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     ESP_RETURN_ON_FALSE(s_pipe.rx_buf, ESP_ERR_NO_MEM, TAG, "rx buf %d B", PIPE_RX_BUF);
 
@@ -1246,14 +1257,19 @@ esp_err_t app_imgpipe_init(void)
         .timeout_ms = 200,
     };
     ESP_RETURN_ON_ERROR(jpeg_new_decoder_engine(&eng_cfg, &s_pipe.dec), TAG, "jpeg decoder engine");
+#endif
 
     s_pipe.src = app_imgpipe_usb_source();
-    if (s_pipe.src->start) {
+    if (s_pipe.src && s_pipe.src->start) {
         ESP_RETURN_ON_ERROR(s_pipe.src->start(s_pipe.src), TAG, "source start");
     }
 
+#if CONFIG_APP_FACEAI_PC_TEST
     /* 摄像头已经出图就默认用它（板载源优先），否则等 PC 送帧 */
     s_pipe.src_mode = app_camera_ready() ? APP_IMG_SRC_CAM : APP_IMG_SRC_PC;
+#else
+    s_pipe.src_mode = APP_IMG_SRC_CAM;     /* 生产构建只有摄像头源 */
+#endif
 
     /* 钉 CPU0（与 faceai 同核）：解码后驱动 invalidate 生效于本核，消费者同核
      * 读取天然一致；跨核场景由 get_frame 的读者侧 M2C 失效兜底（2026-10-04） */

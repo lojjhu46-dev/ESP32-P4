@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FaceCheck · 云签到</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div id="login" class="login hidden">
+  <form id="loginForm">
+    <h1>FaceCheck <span>云签到</span></h1>
+    <p class="muted">输入部署时生成的访问 Token</p>
+    <input id="loginToken" type="password" autocomplete="current-password" placeholder="Token" autofocus>
+    <button type="submit" class="primary">登录</button>
+    <div id="loginErr" class="err"></div>
+  </form>
+</div>
+
+<div id="app" class="hidden">
+  <header>
+    <div class="brand">FaceCheck <span>云签到</span></div>
+    <nav id="tabs">
+      <button data-tab="events" class="active">签到记录</button>
+      <button data-tab="persons">人员</button>
+      <button data-tab="bank">人脸库</button>
+      <button data-tab="devices">设备</button>
+    </nav>
+    <button id="logout" class="ghost">退出</button>
+  </header>
+
+  <main>
+    <section id="tab-events">
+      <div class="toolbar">
+        <label>起 <input id="from" type="datetime-local"></label>
+        <label>止 <input id="to" type="datetime-local"></label>
+        <input id="personFilter" placeholder="姓名（可选）" autocomplete="off">
+        <input id="deviceFilter" placeholder="设备（可选）" autocomplete="off">
+        <button id="search" class="primary">查询</button>
+        <button id="csv">导出 CSV</button>
+      </div>
+      <div class="meta-row"><span id="eventMeta" class="muted"></span></div>
+      <div class="table-wrap">
+        <table id="eventTable">
+          <thead><tr><th>时间</th><th>姓名</th><th>相似度</th><th>设备</th><th>链路</th><th>照片</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="pager">
+        <button id="prev">上一页</button>
+        <span id="pageInfo" class="muted"></span>
+        <button id="next">下一页</button>
+      </div>
+    </section>
+
+    <section id="tab-persons" class="hidden">
+      <div class="toolbar">
+        <button id="reloadPersons">刷新</button>
+        <span id="personsMeta" class="muted"></span>
+      </div>
+      <div class="table-wrap">
+        <table id="personTable">
+          <thead><tr><th>姓名</th><th>特征数</th><th>状态</th><th>签到次数</th><th>最近签到</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p class="hint">名单由板端 db_export 的人脸库快照解析生成；删除/新增请在板端完成，再同步人脸库。<br>
+      特征数按 face.db 的有效槽位统计：名表中指向已删除槽（id=0）的条目不计数，所以可能比板端名单页少 1。</p>
+    </section>
+
+    <section id="tab-bank" class="hidden">
+      <div class="toolbar">
+        <button id="reloadBank">刷新</button>
+        <a id="downloadBank" class="button" href="/api/facebank/latest">下载最新库</a>
+        <label class="file">上传 JCDF .bin<input id="uploadBank" type="file" accept=".bin"></label>
+        <span id="bankMeta" class="muted"></span>
+      </div>
+      <div class="table-wrap">
+        <table id="bankTable">
+          <thead><tr><th>版本</th><th>时间</th><th>设备</th><th>大小</th><th>CRC32</th><th>人数</th><th>特征数</th><th>下载</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p class="hint">云端只保存板端原始快照，不做特征比对、不重排 id。下发会覆盖设备现有库（板端会先备份为 face_bak.db / names.bak）。</p>
+    </section>
+
+    <section id="tab-devices" class="hidden">
+      <div class="toolbar">
+        <button id="reloadDevices">刷新</button>
+        <span id="devicesMeta" class="muted"></span>
+      </div>
+      <div class="table-wrap">
+        <table id="deviceTable">
+          <thead><tr><th>设备</th><th>最近心跳</th><th>库特征数</th><th>固件</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div id="photoModal" class="modal hidden">
+  <div class="modal-box">
+    <img id="photoImg" alt="签到抓拍">
+    <div class="modal-actions"><span id="photoCaption" class="muted"></span><button id="closePhoto">关闭</button></div>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>

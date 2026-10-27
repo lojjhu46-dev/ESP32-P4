@@ -107,12 +107,12 @@ void LinkSession::close()
         delete m_h264;
         m_h264 = nullptr;
     }
-    if (m_db.pump) {
-        m_db.pump->stop();
-        m_db.pump->deleteLater();
-        m_db.pump = nullptr;
-    }
+    if (m_db.pump) m_db.pump->stop();
+    if (m_db.watchdog) m_db.watchdog->stop();
     m_db.busy = false;
+    m_db.data.clear();
+    m_db.got = 0;
+    if (m_grab.timer) m_grab.timer->stop();
     m_parser.reset();
     emit disconnected();
 }
@@ -296,6 +296,7 @@ void LinkSession::handleFrame(const jcl::Frame &f)
         }
         memcpy(m_db.data.data() + off, chunk.constData(), size_t(chunk.size()));
         m_db.got += quint32(chunk.size());
+        dbArmWatchdog(8000);
         const int pct = m_db.expectSize ? int(quint64(m_db.got) * 100u / m_db.expectSize) : 0;
         emit dbProgress(pct, QStringLiteral("接收 %1%  (%2 / %3 B)")
                                  .arg(pct).arg(m_db.got).arg(m_db.expectSize));
@@ -356,10 +357,42 @@ void LinkSession::dbFinish(bool ok, const QString &msg)
     if (m_db.pump) {
         m_db.pump->stop();
     }
+    if (m_db.watchdog) {
+        m_db.watchdog->stop();
+    }
     m_db.busy = false;
     m_db.data.clear();
     m_db.got = 0;
     emit dbDone(ok, msg);
+}
+
+/* 看门狗只在任务在途时有效：分片不再前进就判失败，
+   否则 m_db.busy 会一直挂着，之后所有库任务只能靠重启程序恢复 */
+void LinkSession::dbArmWatchdog(int idleMs)
+{
+    if (!m_db.watchdog) {
+        m_db.watchdog = new QTimer(this);
+        m_db.watchdog->setSingleShot(true);
+        connect(m_db.watchdog, &QTimer::timeout, this, [this]() {
+            if (!m_db.busy) {
+                return;
+            }
+            dbFinish(false, m_db.isImport
+                        ? QStringLiteral("导入分片发送超时：已发 %1/%2 片")
+                              .arg(m_db.sentChunks).arg(m_db.totalChunks)
+                        : QStringLiteral("分片接收超时：已收 %1/%2 B")
+                              .arg(m_db.got).arg(m_db.expectSize));
+        });
+    }
+    m_db.watchdog->start(idleMs);
+}
+
+/* 开新任务前清状态，但保留已创建的看门狗定时器 */
+void LinkSession::dbResetJob()
+{
+    QTimer *wd = m_db.watchdog;
+    m_db = DbJob{};
+    m_db.watchdog = wd;
 }
 
 void LinkSession::dbExport(const QString &path)
@@ -368,7 +401,7 @@ void LinkSession::dbExport(const QString &path)
         emit dbDone(false, QStringLiteral("已有备份任务在跑"));
         return;
     }
-    m_db = DbJob{};
+    dbResetJob();
     m_db.busy = true;
     m_db.isImport = false;
     m_db.path = path;
@@ -393,6 +426,7 @@ void LinkSession::dbExport(const QString &path)
         }
         m_db.data = QByteArray(int(m_db.expectSize), '\0');
         m_db.got = 0;
+        dbArmWatchdog(8000);
         emit dbProgress(0, QStringLiteral("等待分片…共 %1 B / %2 片")
                                .arg(m_db.expectSize)
                                .arg(dbx.value(QStringLiteral("parts")).toInt()));
@@ -454,7 +488,7 @@ void LinkSession::dbImport(const QString &path)
         return;
     }
 
-    m_db = DbJob{};
+    dbResetJob();
     m_db.busy = true;
     m_db.isImport = true;
     m_db.path = path;
@@ -480,6 +514,7 @@ void LinkSession::dbImport(const QString &path)
         m_db.pump->setInterval(1);
         connect(m_db.pump, &QTimer::timeout, this, &LinkSession::pumpImport);
         m_db.pump->start();
+        dbArmWatchdog(20000);
     }, 5000);
 }
 
@@ -509,6 +544,7 @@ void LinkSession::pumpImport()
         m_db.sentChunks++;
     }
     const int pct = m_db.totalChunks ? int(quint64(m_db.sentChunks) * 100u / quint64(m_db.totalChunks)) : 0;
+    dbArmWatchdog(20000);
     emit dbProgress(pct, QStringLiteral("发送 %1%  (%2 / %3 片)")
                              .arg(pct).arg(m_db.sentChunks).arg(m_db.totalChunks));
 
