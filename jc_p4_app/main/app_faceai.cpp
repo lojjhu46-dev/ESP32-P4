@@ -567,6 +567,20 @@ static void reg_rollback(void)
 /* 回收"有特征、没名字"的孤儿槽位（历史遗留 + 掉电在 names_save 之前造成）。
    face.db 布局：6 B 头(u16 total|u16 valid|u16 feat_len) + total * (u16 id + feat_len*f32)，
    槽位按位置寻址、id 永不复用，所以第 i 槽的 id 要么是 i+1 要么是 0（空洞）。 */
+
+/* 读 face.db 头的 num_feats_total：enroll_feat 的下一槽号就是它 +1 */
+static esp_err_t db_read_feat_total(uint16_t *total_out)
+{
+    FILE *f = fopen(s_db_path, "rb");
+    if (!f) return ESP_FAIL;
+    uint16_t hdr[3] = { 0 };
+    const bool ok = (fread(hdr, sizeof(hdr), 1, f) == 1) && hdr[2] > 0 && hdr[0] <= MAX_FEATS;
+    fclose(f);
+    if (!ok) return ESP_FAIL;
+    *total_out = hdr[0];
+    return ESP_OK;
+}
+
 static int lib_gc_orphans(const char *why)
 {
     if (!s_db_ok || !s_db || s_name_cnt == 0) return 0;
@@ -1456,43 +1470,57 @@ static void handle_frame(const img_frame_t &fr)
                 msg = msgbuf;                    /* 保持 pending，等质量达标的一帧 */
             } else {
                 dl::TensorBase *f = feat_run(img, big->keypoint);
+                uint16_t before = 0, after = 0;
+                const bool have_before = (db_read_feat_total(&before) == ESP_OK);
                 if (f && s_db->enroll_feat(f) == ESP_OK) {
-                    /* enroll_feat 只追加、id 永不复用，直接问它新槽号。
-                       早先用 query_feat(0.999) 反查会命中同一个人的旧特征，
-                       把名字绑到别人的槽上（2026-10-26 实测把 personB 顶成了 personA） */
-                    uint16_t id = s_db->last_enrolled_id();
-                    if (id && name_add(id, s_reg_name)) {
-                        if (s_reg_id_cnt < FACE_ENROLL_MAX_SHOTS) {
-                            s_reg_ids[s_reg_id_cnt++] = id;
-                        }
-                        s_reg_got++;
-                        s_reg_last_us = fr.ts_us;
-                        if (s_reg_got >= s_reg_shots) {
-                            names_save();
-                            s_reg_id_cnt = 0;   /* 会话已落盘，回滚不再适用 */
-                            match_name = s_reg_name;    /* 结果里带上刚注册的名字，host 可核对 */
-                            event = "registered";
-                            s_lib_dirty = true;
-                            s_reg_pending = false;
-                            snprintf(msgbuf, sizeof(msgbuf), "enrolled %d/%d (feats %d)",
-                                     s_reg_got, s_reg_shots, s_name_cnt);
-                            msg = msgbuf;
-                            ESP_LOGI(TAG, "registered '%s' x%d as id %u (feats %d, persons %d)",
-                                     s_reg_name, s_reg_got, (unsigned)id, s_name_cnt,
-                                     name_count_persons());
-                        } else {
-                            event = "enrolling";
-                            snprintf(msgbuf, sizeof(msgbuf),
-                                     "collected %d/%d - stay in view, vary angle slightly",
-                                     s_reg_got, s_reg_shots);
-                            msg = msgbuf;
-                        }
-                    } else {
+                    /* enroll_feat 只把特征追加到 num_feats_total+1、id 永不复用，所以读一次
+                       face.db 头就知道新槽号。早先用 query_feat(0.999) 反查会命中同一个人的
+                       旧特征，把名字绑到别人的槽上（2026-10-26 实测把 personB 顶成了 personA）。
+                       esp-dl 是无 remote 的 gitlink，补丁进不了库，故板端自算。 */
+                    const bool have_after = (db_read_feat_total(&after) == ESP_OK);
+                    if (!have_before || !have_after || after != (uint16_t)(before + 1)) {
                         event = "error";
-                        msg = id ? "id busy" : "lib full";
+                        msg = "id mismatch";
                         s_reg_pending = false;
                         s_reg_shots = 0;
-                        reg_rollback();
+                        reg_rollback();   /* 这帧已成孤儿，交给 lib_gc_orphans 回收 */
+                        ESP_LOGE(TAG, "enroll id mismatch: total %u -> %u (feat %d)",
+                                 (unsigned)before, (unsigned)after, s_db->get_num_feats());
+                    } else {
+                        uint16_t id = after;
+                        if (name_add(id, s_reg_name)) {
+                            if (s_reg_id_cnt < FACE_ENROLL_MAX_SHOTS) {
+                                s_reg_ids[s_reg_id_cnt++] = id;
+                            }
+                            s_reg_got++;
+                            s_reg_last_us = fr.ts_us;
+                            if (s_reg_got >= s_reg_shots) {
+                                names_save();
+                                s_reg_id_cnt = 0;   /* 会话已落盘，回滚不再适用 */
+                                match_name = s_reg_name;    /* 结果里带上刚注册的名字，host 可核对 */
+                                event = "registered";
+                                s_lib_dirty = true;
+                                s_reg_pending = false;
+                                snprintf(msgbuf, sizeof(msgbuf), "enrolled %d/%d (feats %d)",
+                                         s_reg_got, s_reg_shots, s_name_cnt);
+                                msg = msgbuf;
+                                ESP_LOGI(TAG, "registered '%s' x%d as id %u (feats %d, persons %d)",
+                                         s_reg_name, s_reg_got, (unsigned)id, s_name_cnt,
+                                         name_count_persons());
+                            } else {
+                                event = "enrolling";
+                                snprintf(msgbuf, sizeof(msgbuf),
+                                         "collected %d/%d - stay in view, vary angle slightly",
+                                         s_reg_got, s_reg_shots);
+                                msg = msgbuf;
+                            }
+                        } else {
+                            event = "error";
+                            msg = "id busy";
+                            s_reg_pending = false;
+                            s_reg_shots = 0;
+                            reg_rollback();
+                        }
                     }
                 } else {
                     event = "error";
