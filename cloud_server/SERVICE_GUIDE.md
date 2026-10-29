@@ -272,4 +272,4 @@ curl -s http://127.0.0.1:18080/api/health
 
 ---
 
-*程序源码与测试方案：`cloud_server/`（`app.py`、`db.py`、`facebank.py`、`web/`、`TEST_PLAN_PC_IMAGE.md`）；硬件/固件说明见仓库 `docs/H264重构交接与阶段计划.md`。*
+*程序源码与测试方案：`cloud_server/`（`app.py`、`db.py`、`facebank.py`、`web/`、`TEST_PLAN_PC_IMAGE.md`）；硬件/固件说明见仓库 `docs/library/H264重构交接与阶段计划.md`。*

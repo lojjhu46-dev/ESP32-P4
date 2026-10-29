@@ -2,7 +2,7 @@
 /*
  * app_netlink —— JCLINK over TCP（以太网，板子做 server）
  *
- * 帧格式/CRC/解析与 USB CDC 完全一致（见 docs/usb_link_protocol.md），
+ * 帧格式/CRC/解析与 USB CDC 完全一致（见 docs/library/usb_link_protocol.md），
  * 只是把字节流从 tinyusb CDC 换成了 lwIP socket：
  *   PC(TCP client) --帧字节流--> netlink rx task --> app_usb_link_feed() --> 帧解析
  *   板端 --app_usb_link_send()--> jcl_transport_t(tcp write) --> PC

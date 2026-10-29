@@ -1,6 +1,6 @@
 """JCLINK v1 协议实现（PC 端）
 
-与板端 main/app_usb_link.c 一一对应，见 jc_p4_app/docs/usb_link_protocol.md：
+与板端 main/app_usb_link.c 一一对应，见 docs/library/usb_link_protocol.md：
     'J''C' | type(1) | seq(1) | len(u32 LE) | payload | crc16(2 LE)
     crc16 = CRC-16/CCITT-FALSE(init 0xFFFF) over type+seq+len+payload
 

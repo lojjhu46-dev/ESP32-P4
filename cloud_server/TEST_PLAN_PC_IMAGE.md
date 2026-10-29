@@ -5,7 +5,7 @@
 
 > **2026-10-24 更新**：已实现固件测试库（`APP_FACEAI_PC_TEST`）+ Qt「PC测试」页
 > （`QT_HOST_PC_TEST`）+ 独立测试云（`install.sh --test`，18080 loopback），完整流程见
-> `docs/H264重构交接与阶段计划.md` §15.8。**当前生产固件已裁掉 PC 源（`src=pc` 被拒）**，
+> `docs/library/H264重构交接与阶段计划.md` §15.8。**当前生产固件已裁掉 PC 源（`src=pc` 被拒）**，
 > 本文件下方的 `_dev/cloud_pc_e2e.py` 只适用于旧 PC 源生产固件；现应使用测试构建 +
 > Qt 测试页，或先给脚本补 `testlib` 分支。
 

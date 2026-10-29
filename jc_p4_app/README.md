@@ -5,7 +5,7 @@ Guition JC-ESP32P4-M3-DEV（ESP32-P4 @360MHz + ESP32-C6 Wi-Fi6/BLE，32MB PSRAM�
 → esp-dl 人脸检测 + 特征 + 1:N 识别 → 结果 JSON（JCLINK 0x02）+ 硬件 JPEG 预览（0x05），
 PC 端 LVGL SDL 模拟器与板端同源 UI 显示与操作。
 
-**新会话/新 agent 接手：先读 [`docs/HANDOVER.md`](docs/HANDOVER.md)**（全部踩坑与结论都在那里，
+**新会话/新 agent 接手：先读 [`docs/library/HANDOVER.md`](../docs/library/HANDOVER.md)**（全部踩坑与结论都在那里，
 本 README 只做导览）。
 
 > ⚠️ **本仓库不含第三方组件与厂商资料**（体积原因）：`esp-dl/`、`esp-adf-libs/`、`lvgl/`、
@@ -23,6 +23,13 @@ PC 端 LVGL SDL 模拟器与板端同源 UI 显示与操作。
   **F6 事件去重**（同人 match 5s 一次）、**F7 多人脸**（boxes 带各自 name/sim）、
   **F4 轻跟踪节流**（特征提取 ≤1/HOLD）、每人多特征、FAT 特征库 + NVS 名表
 - **吞吐**：帧池 4 槽 + 发布端按需发布（无人消费的帧跳过 copy/后处理）+ stream 源守卫
+- **H.264 码流（2026-10-23 起，本工作区主线）**：SC2336 YUV420 → `/dev/video11` 硬编 →
+  JCLINK **0x07**（20B 头 + Annex-B AU），640×480@1Mbps 实测 20~24fps；发送预算视频 50ms /
+  控制帧 500ms（拥塞时丢视频不丢 ack）；帧类型与字段见
+  [`docs/library/usb_link_protocol.md`](../docs/library/usb_link_protocol.md)，阶段实测见
+  [`docs/library/H264重构交接与阶段计划.md`](../docs/library/H264重构交接与阶段计划.md) §11~§12
+- **云签到旁路（板端侧）**：`db_export`/`db_import`（0x06 JCDF 快照）+ 结果帧驱动 Qt 上报，
+  见下节「板端在云签到里的职责边界」
 - **连接**：网口 192.168.33.2:3333（TCP JCLINK）、WiFi（`{"cmd":"wifi"}` 运行时配网）、
   BLE 广播 "JC-P4"（NimBLE host on P4 + C6 controller）
 - 预览/显示：0x05 硬件 JPEG 回传 → 模拟器（480x800 竖屏 UI：注册向导/稳定态/脸宽反馈/
@@ -30,7 +37,7 @@ PC 端 LVGL SDL 模拟器与板端同源 UI 显示与操作。
   `Shots: 1/3/5` 英文标题、关窗不再残留全屏遮罩——详见 HANDOVER 廿二节 17 节）；
   板端 800x1280 屏驱动就绪（`APP_ENABLE_DISPLAY`，无屏期关闭）
 - ⚠️ 已知限制：esp-dl 特征提取在 P4 上存在执行级非确定性（详见
-  `docs/esp-dl_issue_draft.md` 与 HANDOVER 廿二节 14/15 节）——绝对阈值跨开机不可移植，
+  `docs/library/esp-dl_issue_draft.md` 与 HANDOVER 廿二节 14/15 节）——绝对阈值跨开机不可移植，
   每 boot 相对标定 + 多帧投票绕行
 
 ## 仓库布局
@@ -38,13 +45,13 @@ PC 端 LVGL SDL 模拟器与板端同源 UI 显示与操作。
 ```
 jc_p4_app/            本工程（IDF v5.5.5）
   main/               应用代码（模块见下表）
-  docs/HANDOVER.md    ★ 接手文档：全部结论/踩坑/验收记录（最优先阅读）
-  docs/face_recog_day_plan.md   人脸识别功能规划（P0~P3 + 三轮实施）
-  docs/usb_link_protocol.md     JCLINK 协议规范（两端共用）
-  docs/pc_link_references.md    esp-dl/tinyusb 等技术核实记录
-  docs/esp-dl_issue_draft.md    esp-dl 特征非确定性 issue 草稿（⏳ 待提交）
-  docs/img/           UI/验收截图
   tools/              串口抓取/图像转换/传感器 patch 脚本
+  ★ 本工程 docs/ 已清空：文档集中到仓库根 docs/library/（2026-10-29 迁移，SHA-256 逐个核对）
+  ../docs/library/HANDOVER.md            主交接文档：全部结论/踩坑/验收记录（最优先阅读）
+  ../docs/library/face_recog_day_plan.md 人脸识别功能规划（P0~P3 + 三轮实施）
+  ../docs/library/usb_link_protocol.md   JCLINK 协议规范（两端共用）
+  ../docs/library/pc_link_references.md  esp-dl/tinyusb 等技术核实记录
+  ../docs/library/esp-dl_issue_draft.md  esp-dl 非确定性 issue 草稿（⏳ 待提交）；img/ 存 UI/验收截图
   sdkconfig.defaults  关键配置（BT/WiFi/栈/主频等，改动需 idf.py reconfigure）
 pc_host/              PC 侧 Python 工具（仅标准库 + pyserial；py3.14 另有 cv2/Pillow）
   protocol.py         JCLINK 帧/CRC/TCP 传输库（其他脚本的依赖；ack 按命令名精确匹配）
@@ -118,8 +125,25 @@ python pc_host/thr_calib.py --tcp 192.168.33.2:3333                 # 阈值标�
 | `{"cmd":"cam","fps":N,"dn":0-3,"night":true,"ae":true,...}` | 摄像头/夜视/AE 总控 |
 | `{"cmd":"cam","ae_exp_max_ms":40}` | AE 曝光上限（0=解除；夜视档自动解除） |
 | `{"cmd":"cam","pub_demand":false}` | 按需发布开关（默认开） |
-| `{"cmd":"stream","value":"on","fmt":"jpeg/raw"}` | 0x05 预览开关 |
+| `{"cmd":"stream","value":"on","fmt":"jpeg/raw"}` | 0x05 预览开关（H.264 固件下 `off` 只回 ack 不停流，见阶段计划 §14.4） |
+| `{"cmd":"src","value":"cam"\|"pc"}` | 切板载摄像头 / PC 送帧（生产固件拒绝 `pc`） |
+| `{"cmd":"db_export"}` | 0x06 分片导出 **JCDF 人脸库快照**（ack 带 `bytes/parts/crc32`；云同步的数据源） |
+| `{"cmd":"db_import","size":N,"crc":X}` → 分片 → `db_import_end` / `db_import_abort` | 0x06 覆盖式导入库（导入前自动备份 `face_bak.db`/`names.bak`） |
+| `{"cmd":"testlib","value":"on"\|"off"\|"status","reset":true}` | 测试库切换（**仅 `CONFIG_APP_FACEAI_PC_TEST=y` 的构建有**） |
 | `{"cmd":"wifi","ssid":X,"pass":Y}` | WiFi 运行时配网（NVS 保存） |
+
+### 板端在云签到里的职责边界（v1，2026-10-26 公网真人实测验收）
+
+**板端只做本地比对，不直连云端**；云签到是 Qt 上位机的旁路，固件侧配合点只有三处：
+
+1. 识别到 `event=="match"` 的结果帧（0x02）→ Qt 转成签到事件 + 从 0x07/0x05 画面裁的抓拍上报；
+2. `db_export` 出 JCDF 快照（名表 + face.db 原始字节）→ Qt 上传；云端下发时走 `db_import` 覆盖本地库；
+3. `registered` / `deleted` 结果帧是 Qt 触发"名单已变化 → 自动同步"的唯一信号，
+   ⚠️ 而 `send_result()` 丢弃了发送返回值，USB 拥塞时该帧可能静默丢失 → 云端库落后且无告警
+   （遗留缺陷与候选修法见 [`docs/library/H264重构交接与阶段计划.md`](../docs/library/H264重构交接与阶段计划.md) §15.10 遗留 5）。
+
+**云端绝不保存比对逻辑、不比对特征**（esp-dl 特征跨 boot/跨设备非确定）。事件去重、抓拍存储、
+CSV/Web 后台都在 `cloud_server/`；上位机侧见 `../qt_host/README.md`「云」页。
 
 ## 硬性纪律（踩过的坑，违反会重蹈）
 
@@ -158,10 +182,10 @@ python pc_host/thr_calib.py --tcp 192.168.33.2:3333                 # 阈值标�
 ## 当前待办（详见 HANDOVER 头部速览）
 
 1. 镜头对准拍摄位 + 补光——检出连续性（21%）与成簇性是识别率唯一剩余瓶颈
-2. ⏳ 提交 esp-dl issue（英文草稿 `docs/esp-dl_issue_draft.md` + 补丁 + trace 已备；
+2. ⏳ 提交 esp-dl issue（英文草稿 `docs/library/esp-dl_issue_draft.md` + 补丁 + trace 已备；
    Espressif 修复前，绝对阈值跨开机不可用，每 boot 相对标定绕行）
 3. ae_accept_test.py 按 AE 曝光上限重校；白天自然光白参考重标（wb_kr/kb + ccm_mix）；
    BLE 手机端 nRF Connect 交互验收
 4. P3 可选进阶：F11 换检测/特征模型、F12 活体防照片、F13 事件外发（见
-   `docs/face_recog_day_plan.md`）—— **第 3 轮 F8/F9/F10 已全部完成 ✅**
+   `docs/library/face_recog_day_plan.md`）—— **第 3 轮 F8/F9/F10 已全部完成 ✅**
    （F9 名表 64 人 `names.json`；F10 库备份/恢复 JCLINK 0x06 + `jc_test.py db_backup/db_restore`）

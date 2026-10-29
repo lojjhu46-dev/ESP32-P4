@@ -6,7 +6,7 @@
  *        crc16 = CRC-16/CCITT-FALSE(init 0xFFFF)，范围 = type+seq+len+payload
  *
  * type：0x01 JPEG(PC→板) 0x02 结果JSON 0x03 命令JSON 0x04 日志 0x05 图像 0x06 块数据
- * 详见 jc_p4_app/docs/usb_link_protocol.md
+ * 详见 docs/library/usb_link_protocol.md
  */
 #include <QByteArray>
 #include <QVector>

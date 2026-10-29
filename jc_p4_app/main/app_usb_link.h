@@ -6,7 +6,7 @@
 extern "C" {
 #endif
 
-/* JCLINK v1 frame types (see docs/usb_link_protocol.md) */
+/* JCLINK v1 frame types (see docs/library/usb_link_protocol.md) */
 #define JCL_TYPE_JPEG    0x01   /* PC -> board, JPEG frame */
 #define JCL_TYPE_RESULT  0x02   /* board -> PC, JSON result */
 #define JCL_TYPE_CMD     0x03   /* PC -> board, JSON command */

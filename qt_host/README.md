@@ -3,7 +3,7 @@
 ESP32-P4 边缘人脸识别终端的 PC 上位机：**同时支持网口（TCP）与高速 USB（CDC 串口）**，
 接收 0x05（JPEG/raw）或 **0x07（H.264）**视频流并显示，叠加 0x02 检测结果，内置全功能控制面板（流/名单/识别/相机/备份）。
 
-> **新会话接手先读**：[`../jc_p4_app/docs/HANDOVER.md`](../jc_p4_app/docs/HANDOVER.md) 第廿五节
+> **新会话接手先读**：[`../docs/library/HANDOVER.md`](../docs/library/HANDOVER.md) 第廿五节
 > （USB 视频流 + Qt 上位机的实测数据与坑）。
 
 ## 1. 依赖与环境（本机已就位）
@@ -76,10 +76,43 @@ powershell -ExecutionPolicy Bypass -File qt_host\build.ps1 -Run     # 构建后�
   - **识别**：detect/match、thr_lo、thr_hi、fast_thr、dedup_ms、multi
   - **相机**：gain/exp 滑块、帧率档、镜像、AE、AWB、夜视、低光照停人脸、降噪档
   - **备份**：F10 特征库导出 `.bin` / 导入（覆盖式，板端自动 `.bak`）+ 进度条
+  - **云**：签到事件与抓拍上报、人脸库上传/下发（详见 §4b）
 - **快捷键**：`S` 截图 · `R` 重连
 - 截图存到 **exe 同目录的 `shots/`**（PNG，含检测框叠加层，按原始分辨率出图）
 
 连接成功后会自动发一轮状态查询（`mode`/`cam`/`stream`/`link`/`list`）把控件同步成板端真实值。
+
+## 4b. 云签到「云」页（2026-10-24 上线，10-26 公网真人实测验收）
+
+**边界**：人脸比对全在板端；Qt 只做转发与抓拍裁剪，云端只存签到事件/照片/人脸库快照，**不做特征比对**。
+
+| 控件 | 行为 |
+|---|---|
+| 服务器 / Token / 设备名 | 默认 `http://<CLOUD_IP>:8080`、设备名取本机名；Token 是服务器 `install.sh` 生成的那串（本机副本在 `_dev/.tok`，**别写进提交**） |
+| ☑ 启用云签到（识别到 match 时上报） | 关 = 完全不联网；配置存 QSettings `cloud/enabled`、`cloud/url`、`cloud/token`、`cloud/device` |
+| ☑ 签到抓拍（按人脸框裁剪 JPEG 上传） | 从当前画面裁人脸框 → `POST /api/events` 的 `photo_b64`；`cloud/photo` |
+| ☑ 注册/删除后自动同步人脸库 | 收到板端 `registered`/`deleted` 结果帧 → 导出 JCDF 快照 → `POST /api/facebank`；`cloud/autoSync` |
+| 「保存配置并测试连接」 | `GET /api/health` 探活，顺带读回 `dedup_window_s` 用于本地静默 |
+| 「上传板端人脸库到云端」/「从云端同步人脸库到板端」 | 手动上传；下发走 `GET /api/facebank/latest` → 板端 `db_import`（覆盖前板端自动 `.bak`） |
+| 「打开网页后台」 | 浏览器打开服务端 Web 台（事件/名单/快照/CSV） |
+
+**去重是两层**：板端 5s 边沿去重（只压事件帧，实时 UI 仍每帧显示人脸）+ **服务端按 `person+device` 滚动去重**
+（生产 1800s = 半小时一次；命中重复时事件与抓拍照片都不写入）。Qt 从 `/api/health` 读到 `dedup_window_s` 后，
+本地静默取 `min(服务器窗口, 30min)`。
+
+**断网补发**：未送达的任务落 `cloud_pending.jsonl`
+（`%APPDATA%\jc_p4_app\qt_host\`，测试页另用 `cloud_pending_pctest.jsonl`），恢复后按队列重放；
+补发可能乱序到达，所以服务端窗口是**对称 ±window**。
+
+**已知缺口**：① 自动同步只由单条 best-effort `registered`/`deleted` 结果帧触发，USB 拥塞时该帧可能静默丢失
+→ 云端库落后且无告警（注册后确认日志里有 `☁ 名单已变化`，否则手动点上传）；② 「从云端同步到板端」只拉最新版，
+不支持选历史版本回滚（服务端 `?id=N` 已支持）。详见
+[`../docs/library/H264重构交接与阶段计划.md`](../docs/library/H264重构交接与阶段计划.md) §15 与
+[`../docs/library/嵌入式软件测试与修复实践手册.md`](../docs/library/嵌入式软件测试与修复实践手册.md) F 章；
+服务端侧见 [`../cloud_server/README.md`](../cloud_server/README.md)。
+
+免光照验证路径：固件 `CONFIG_APP_FACEAI_PC_TEST=y` 测试构建 + Qt `QT_HOST_PC_TEST`「PC测试」页
+（原图直接作 `photo_b64`、独立 spool、阻断生产上报）+ `install.sh --test` 的 `127.0.0.1:18080` 实例。
 
 ## 5. 无界面自检（脚本化验收）
 
@@ -120,7 +153,7 @@ raw@10 = **1389/1297 KB/s** ⇒ **两条链路吞吐同档（±10%）**。
 - 脚本：`qt_host.exe --selftest --serial COM5 --grab-raw out.png` → `grab-raw: ok=1 640x480 data=614400B`
 
 ⚠️ 测吞吐时**必须持续读**（CDC 背压），且**不能在流中发查询**（0x02 洪泛会让 ack 匹配失败）——
-细节见 `jc_p4_app/docs/HANDOVER.md` 第廿五节 §3.2。
+细节见 `docs/library/HANDOVER.md` 第廿五节 §3.2。
 
 ## 6.1 吞吐基准工具
 
