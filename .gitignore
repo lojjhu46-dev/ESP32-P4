@@ -46,3 +46,6 @@ __pycache__/
 .codebuddy/
 .zcode/
 .zcodeignore
+
+# --- 本机私有部署速查（含真实 IP / 机器名 / MAC / 姓名映射，绝不入库）---
+docs/private/

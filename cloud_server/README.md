@@ -29,13 +29,13 @@ facecheck.db          events / facebank_snapshots / persons / devices
 photos/YYYY/MM/DD/    签到抓拍（JPEG，默认保留 90 天）
 ```
 
-## 安装（Alibaba Cloud Linux 3 / RHEL 8 系）
+## 安装（RHEL 8 系 Linux，服务器具体发行版见本机私有速查）
 
 ```bash
 # Windows Git Bash 打包上传（服务器无 git）
 tar czf facecheck.tgz cloud_server
-scp facecheck.tgz root@<CLOUD_IP>:/tmp/
-ssh root@<CLOUD_IP> "tar xzf /tmp/facecheck.tgz -C /opt && bash /opt/cloud_server/install.sh"
+scp facecheck.tgz <部署账号>@<CLOUD_IP>:/tmp/
+ssh <部署账号>@<CLOUD_IP> "tar xzf /tmp/facecheck.tgz -C /opt && bash /opt/cloud_server/install.sh"
 ```
 
 安装脚本会生成 `/etc/facecheck.json`（含 Token 与 cookie 密钥），并打印一次 Token；
@@ -98,4 +98,4 @@ sqlite3 /var/lib/facecheck/facecheck.db 'select count(*) from events;'
 ```
 
 照片默认保留 90 天（`photo_keep_days`），后台每小时级 janitor 清理并 checkpoint WAL。
-1 GiB 无 swap 的机器建议额外创建 1G swapfile（见安装脚本末尾提示）。
+小内存且无 swap 的机器建议额外创建 swapfile（见安装脚本末尾提示）。

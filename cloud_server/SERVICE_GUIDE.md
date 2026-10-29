@@ -1,6 +1,6 @@
 # FaceCheck 云签到服务 · 部署与使用说明
 
-> 版本：v1（2026-10-24） · 运行环境：Alibaba Cloud Linux 3 / Python 3.6.8 / systemd
+> 版本：v1（2026-10-24） · 运行环境：Linux + systemd，纯 Python 3.6 标准库（服务器具体发行版与规格不在本仓库记录）
 > 本文档同时适用于生产实例（8080）和独立测试实例（18080）。
 
 ---
@@ -38,7 +38,7 @@ P4 板端（检测 + MFN 特征 + 1:N）
 
 - 生产库当前人员：`personA`、`personB`；快照为板端 45259 B 的生产库。
 - 测试实例是**完全独立**的 SQLite/照片/Token；测试数据不进入生产库。
-- 云服务器：2 vCPU / 1 GiB / 30G 系统盘 / 无 swap；服务 RSS 约 20–25 MB。
+- 云服务器为小规格单机（内存紧张、默认无 swap）；服务常驻 RSS 约 20–25 MB。具体规格与登录账号见本机私有速查 `docs/private/`（不入库）。
 
 ---
 
@@ -63,8 +63,8 @@ SQLite 使用 WAL；每个请求独立连接 + `busy_timeout=5000`。人脸库�
 ```bash
 # Windows 侧打包（仓库根目录）
 tar czf _dev/facecheck.tgz --exclude='__pycache__' --exclude='*.pyc' cloud_server
-scp _dev/facecheck.tgz root@<CLOUD_IP>:/tmp/
-ssh root@<CLOUD_IP> "tar xzf /tmp/facecheck.tgz -C /opt && bash /opt/cloud_server/install.sh"
+scp _dev/facecheck.tgz <部署账号>@<CLOUD_IP>:/tmp/
+ssh <部署账号>@<CLOUD_IP> "tar xzf /tmp/facecheck.tgz -C /opt && bash /opt/cloud_server/install.sh"
 ```
 
 安装脚本会：
@@ -76,7 +76,7 @@ ssh root@<CLOUD_IP> "tar xzf /tmp/facecheck.tgz -C /opt && bash /opt/cloud_serve
 ### 4.2 独立测试实例（推荐用于 PC 送图/回归）
 
 ```bash
-ssh root@<CLOUD_IP> "tar xzf /tmp/facecheck.tgz -C /opt && \
+ssh <部署账号>@<CLOUD_IP> "tar xzf /tmp/facecheck.tgz -C /opt && \
   bash /opt/cloud_server/install.sh --test"
 ```
 
@@ -85,7 +85,7 @@ ssh root@<CLOUD_IP> "tar xzf /tmp/facecheck.tgz -C /opt && \
 - PC 访问：
 
 ```bash
-ssh -L 18080:127.0.0.1:18080 root@<CLOUD_IP> -N
+ssh -L 18080:127.0.0.1:18080 <部署账号>@<CLOUD_IP> -N
 # 浏览器/Qt 访问 http://127.0.0.1:18080
 ```
 
@@ -233,7 +233,7 @@ curl -s http://127.0.0.1:18080/api/health
 ```
 
 - 独立 Token/数据/照片，生产 8080 不受影响；
-- PC 端通过 `ssh -L 18080:127.0.0.1:18080 root@<CLOUD_IP> -N` 访问；
+- PC 端通过 `ssh -L 18080:127.0.0.1:18080 <部署账号>@<CLOUD_IP> -N` 访问；
 - 不用时：`systemctl stop facecheck-test`（不影响生产）。
 
 ---
@@ -250,7 +250,7 @@ curl -s http://127.0.0.1:18080/api/health
 | 照片打不开/404 | 事件没有照片；照片超过保留期已被清理；未登录（401） |
 | `database is locked` | 瞬时并发写；服务已用 WAL + busy_timeout；避免同时手工 sqlite 写 |
 | 服务反复重启 | `journalctl -u facecheck -n 50`；常见为配置 token/secret 为空或数据目录权限 |
-| 内存不足 | `MemoryMax=256M`；查看 `MemoryCurrent`；1GiB 机器建议加 1G swap |
+| 内存不足 | `MemoryMax=256M`；查看 `MemoryCurrent`；小内存机器建议加 swap |
 
 ---
 

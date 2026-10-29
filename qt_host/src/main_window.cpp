@@ -1046,7 +1046,7 @@ QWidget *MainWindow::buildCloudTab()
 
     m_cloudOn = new QCheckBox(QStringLiteral("启用云签到（识别到 match 时上报）"));
     m_cloudUrl = new QLineEdit;
-    m_cloudUrl->setPlaceholderText(QStringLiteral("http://<CLOUD_IP>:8080"));
+    m_cloudUrl->setPlaceholderText(QStringLiteral("http://<服务器地址>:8080"));
     m_cloudToken = new QLineEdit;
     m_cloudToken->setEchoMode(QLineEdit::Password);
     m_cloudToken->setPlaceholderText(QStringLiteral("服务器 install.sh 生成的 Token"));
@@ -1061,7 +1061,7 @@ QWidget *MainWindow::buildCloudTab()
         QSettings s;
         m_cloudOn->setChecked(s.value(QStringLiteral("cloud/enabled"), false).toBool());
         m_cloudUrl->setText(s.value(QStringLiteral("cloud/url"),
-                                    QStringLiteral("http://<CLOUD_IP>:8080")).toString());
+                                    QString()).toString());
         m_cloudToken->setText(s.value(QStringLiteral("cloud/token")).toString());
         QString name = s.value(QStringLiteral("cloud/device"), QHostInfo::localHostName()).toString();
         if (name.trimmed().isEmpty()) name = QStringLiteral("qt_host");
