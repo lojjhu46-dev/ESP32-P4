@@ -49,3 +49,6 @@ __pycache__/
 
 # --- 本机私有部署速查（含真实 IP / 机器名 / MAC / 姓名映射，绝不入库）---
 docs/private/
+
+# --- 阈值标定输出（由真人面部标定得到的参数，本机留存即可，thr_calib.py 会重新生成）---
+pc_host/_thr_calib_*.json

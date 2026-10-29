@@ -1,0 +1,281 @@
+diff --git a/esp-dl/dl/model/include/dl_model_base.hpp b/esp-dl/dl/model/include/dl_model_base.hpp
+index e6f8847..4c07aee 100644
+--- a/esp-dl/dl/model/include/dl_model_base.hpp
++++ b/esp-dl/dl/model/include/dl_model_base.hpp
+@@ -440,6 +440,45 @@ public:
+      */
+     virtual void reset();
+ 
++    /**
++     * @brief Zero the whole inference workspace (both arena roots that back all
++     *        variable/intermediate tensors). Weights live outside the arena and
++     *        are untouched. Call BEFORE providing new inputs: the arena also
++     *        backs the graph input tensors, and they are (re)written by the
++     *        caller / preprocessors after this call.
++     *        Patched 2026-10-06 (jc_p4_app): wires the previously-unused
++     *        ModelContext::root_reset() for the feature-extraction
++     *        determinism experiment — see jc_p4_app/docs/HANDOVER.md.
++     */
++    void zero_workspace();
++
++    /**
++     * @brief Fill the whole inference workspace with random bytes
++     *        (esp_fill_random). Experiment companion of zero_workspace():
++     *        if outputs are invariant under per-run random garbage, the model
++     *        never reads stale workspace memory; if they vary, it does.
++     */
++    void poison_workspace();
++
++    /**
++     * @brief Patched 2026-10-06 (jc_p4_app): run the execution plan while
++     *        CRC32-snapshotting the whole variable arena after every module
++     *        (two entries per stage: internal-root crc, psram-root crc; the
++     *        first two entries are the pre-run state). Diagnostic for the
++     *        feature-extraction non-determinism bisection — see
++     *        jc_p4_app/docs/HANDOVER.md. Runs in RUNTIME_MODE_SINGLE_CORE
++     *        (the same mode as run()'s default).
++     *
++     * @param trace Receives 2 * (modules + 1) CRC32 values.
++     */
++    void run_trace(std::vector<uint32_t> &trace);
++
++    /**
++     * @brief Patched 2026-10-06 (jc_p4_app): name of the execution-plan module
++     *        at @p index (nullptr if out of range). Module::name is public.
++     */
++    const char *module_name(size_t index);
++
+     /**
+      * @brief Get the fbs model instance.
+      *
+diff --git a/esp-dl/dl/model/src/dl_model_base.cpp b/esp-dl/dl/model/src/dl_model_base.cpp
+index 5a1890c..47720ce 100644
+--- a/esp-dl/dl/model/src/dl_model_base.cpp
++++ b/esp-dl/dl/model/src/dl_model_base.cpp
+@@ -4,6 +4,8 @@
+ #include "dl_model_base.hpp"
+ #include "dl_module_creator.hpp"
+ #include "fbs_model.hpp"
++#include "esp_random.h"   // Model::poison_workspace() (jc_p4_app patch, 2026-10-06)
++#include "esp_rom_crc.h"  // Model::run_trace() (jc_p4_app patch, 2026-10-06)
+ 
+ static const char *TAG = "dl::Model";
+ 
+@@ -847,4 +849,102 @@ void Model::reset()
+     }
+ }
+ 
++// Patched 2026-10-06 (jc_p4_app): workspace determinism experiment — see
++// jc_p4_app/docs/HANDOVER.md. The arena roots back ALL variable/intermediate
++// tensors and is calloc'd once at build, never re-zeroed between runs; these
++// two methods expose ModelContext::root_reset() / random fill for callers that
++// must not read stale workspace memory. Weights are NOT in the arena.
++// ⚠️ memset/fill 只写 CPU 缓存（脏行滞留 L1）——P4 上部分 esp-dl 算子若走
++// DSA/DMA 直读内存会看到旧值，所以填充后统一 C2M 回写（UNALIGNED：根内存
++// 16B 对齐，不满足缓存行对齐要求）。
++#include "esp_cache.h"
++
++static void ws_writeback(void *root, size_t size)
++{
++    if (root && size) {
++        esp_cache_msync(root, size,
++                        ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
++    }
++}
++
++void Model::zero_workspace()
++{
++    if (m_model_context) {
++        m_model_context->root_reset();
++        mem_info_t info = {};
++        (void)m_model_context->get_variable_memory_size(info);
++        ws_writeback(m_model_context->get_internal_root(), info.internal);
++        ws_writeback(m_model_context->get_psram_root(), info.psram);
++    }
++}
++
++void Model::poison_workspace()
++{
++    if (!m_model_context) {
++        return;
++    }
++    mem_info_t info = {};
++    (void)m_model_context->get_variable_memory_size(info);
++    if (m_model_context->get_internal_root() && info.internal) {
++        esp_fill_random(m_model_context->get_internal_root(), info.internal);
++        ws_writeback(m_model_context->get_internal_root(), info.internal);
++    }
++    if (m_model_context->get_psram_root() && info.psram) {
++        esp_fill_random(m_model_context->get_psram_root(), info.psram);
++        ws_writeback(m_model_context->get_psram_root(), info.psram);
++    }
++}
++
++void Model::run_trace(std::vector<uint32_t> &trace)
++{
++    trace.clear();
++    // Patch note: one CRC entry per module = CRC over the module's OUTPUT
++    // tensors' logical bytes (m_variables indexed by m_outputs_index) — this
++    // filters don't-care padding noise that made whole-arena CRCs diverge at
++    // random modules. The last entry is the whole-arena CRC.
++    if (!m_model_context) {
++        return;
++    }
++    mem_info_t info = {};
++    (void)m_model_context->get_variable_memory_size(info);
++    uint8_t *psram = (uint8_t *)m_model_context->get_psram_root();
++    uint8_t *internal = (uint8_t *)m_model_context->get_internal_root();
++    for (size_t i = 0; i < m_execution_plan.size(); i++) {
++        dl::module::Module *module = m_execution_plan[i];
++        if (!module) {
++            break;
++        }
++        module->forward(m_model_context, RUNTIME_MODE_SINGLE_CORE);
++        uint32_t crc = 0;
++        bool has = false;
++        for (int idx : module->m_outputs_index) {
++            if (idx < 0 || (size_t)idx >= m_model_context->m_variables.size()) {
++                continue;
++            }
++            TensorBase *t = m_model_context->m_variables[idx];
++            if (t && t->data) {
++                crc = esp_rom_crc32_le(crc, (const uint8_t *)t->data, t->get_bytes());
++                has = true;
++            }
++        }
++        trace.push_back(has ? crc : 0);
++    }
++    uint32_t arena_crc = 0;
++    if (internal && info.internal) {
++        arena_crc = esp_rom_crc32_le(arena_crc, internal, info.internal);
++    }
++    if (psram && info.psram) {
++        arena_crc = esp_rom_crc32_le(arena_crc, psram, info.psram);
++    }
++    trace.push_back(arena_crc);      // last entry: whole-arena CRC
++}
++
++const char *Model::module_name(size_t index)
++{
++    if (index < m_execution_plan.size() && m_execution_plan[index]) {
++        return m_execution_plan[index]->name;
++    }
++    return nullptr;
++}
++
+ } // namespace dl
+diff --git a/esp-dl/vision/recognition/dl_feat_base.cpp b/esp-dl/vision/recognition/dl_feat_base.cpp
+index d22391a..fea1ed3 100644
+--- a/esp-dl/vision/recognition/dl_feat_base.cpp
++++ b/esp-dl/vision/recognition/dl_feat_base.cpp
+@@ -31,6 +31,19 @@ dl::Model *FeatWrapper::get_raw_model()
+     return m_model->get_raw_model();
+ }
+ 
++void FeatWrapper::set_feat_trace(bool on)
++{
++    if (!m_model) {
++        load_model();
++    }
++    m_model->set_feat_trace(on);
++}
++
++const std::vector<uint32_t> &FeatWrapper::get_feat_trace() const
++{
++    return m_model->get_feat_trace();
++}
++
+ FeatImpl::~FeatImpl()
+ {
+     delete m_model;
+@@ -46,7 +59,11 @@ TensorBase *FeatImpl::run(const dl::image::img_t &img, const std::vector<int> &l
+     DL_LOG_INFER_LATENCY_END_PRINT("feat", "pre");
+ 
+     DL_LOG_INFER_LATENCY_START();
+-    m_model->run();
++    if (m_trace_on) {
++        m_model->run_trace(m_trace);   // patch (jc_p4_app 2026-10-06): per-module arena CRC
++    } else {
++        m_model->run();
++    }
+     DL_LOG_INFER_LATENCY_END_PRINT("feat", "model");
+ 
+     DL_LOG_INFER_LATENCY_START();
+@@ -65,5 +82,18 @@ dl::Model *FeatImpl::get_raw_model()
+ {
+     return m_model;
+ }
++
++void FeatImpl::set_feat_trace(bool on)
++{
++    m_trace_on = on;
++    if (!on) {
++        m_trace.clear();
++    }
++}
++
++const std::vector<uint32_t> &FeatImpl::get_feat_trace() const
++{
++    return m_trace;
++}
+ } // namespace feat
+ } // namespace dl
+diff --git a/esp-dl/vision/recognition/dl_feat_base.hpp b/esp-dl/vision/recognition/dl_feat_base.hpp
+index 97256e9..a357751 100644
+--- a/esp-dl/vision/recognition/dl_feat_base.hpp
++++ b/esp-dl/vision/recognition/dl_feat_base.hpp
+@@ -3,6 +3,7 @@
+ #include "dl_feat_image_preprocessor.hpp"
+ #include "dl_feat_postprocessor.hpp"
+ #include "dl_model_base.hpp"
++#include <vector>
+ 
+ namespace dl {
+ namespace feat {
+@@ -12,6 +13,20 @@ public:
+     virtual TensorBase *run(const dl::image::img_t &img, const std::vector<int> &landmarks) = 0;
+     virtual int get_feat_len() = 0;
+     virtual dl::Model *get_raw_model() = 0;
++
++    /**
++     * @brief Patched 2026-10-06 (jc_p4_app): when enabled, the next run()
++     *        calls Model::run_trace() instead of run() so callers can bisect
++     *        per-module arena CRCs (feature determinism experiment, see
++     *        jc_p4_app/docs/HANDOVER.md). Default no-op for implementors
++     *        that do not support tracing.
++     */
++    virtual void set_feat_trace(bool on) {}
++    virtual const std::vector<uint32_t> &get_feat_trace() const
++    {
++        static const std::vector<uint32_t> empty;
++        return empty;
++    }
+ };
+ 
+ class FeatWrapper : public Feat {
+@@ -25,6 +40,8 @@ public:
+     TensorBase *run(const dl::image::img_t &img, const std::vector<int> &landmarks) override;
+     int get_feat_len() override;
+     dl::Model *get_raw_model() override;
++    void set_feat_trace(bool on) override;
++    const std::vector<uint32_t> &get_feat_trace() const override;
+ };
+ 
+ class FeatImpl : public Feat {
+@@ -32,12 +49,16 @@ protected:
+     dl::Model *m_model;
+     dl::image::FeatImagePreprocessor *m_image_preprocessor;
+     dl::feat::FeatPostprocessor *m_postprocessor;
++    bool m_trace_on = false;                   /* patch: per-module arena CRC trace */
++    std::vector<uint32_t> m_trace;             /* patch: last traced run */
+ 
+ public:
+     ~FeatImpl();
+     TensorBase *run(const dl::image::img_t &img, const std::vector<int> &landmarks) override;
+     int get_feat_len() override;
+     dl::Model *get_raw_model() override;
++    void set_feat_trace(bool on) override;
++    const std::vector<uint32_t> &get_feat_trace() const override;
+ };
+ } // namespace feat
+ } // namespace dl
