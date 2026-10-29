@@ -291,7 +291,12 @@ void LinkSession::handleFrame(const jcl::Frame &f)
             break;
         }
         if (quint64(off) + quint64(chunk.size()) > quint64(m_db.data.size())) {
-            dbFinish(false, QStringLiteral("分片越界 off=%1 len=%2").arg(off).arg(chunk.size()));
+            /* 上一轮任务残留的分片：丢弃并计数，别把整次导出判死（末尾有 CRC 兜底） */
+            m_db.stray++;
+            break;
+        }
+        if (off != m_db.got) {
+            m_db.stray++;         /* 非单调偏移同样是上一轮的尾巴，忽略 */
             break;
         }
         memcpy(m_db.data.data() + off, chunk.constData(), size_t(chunk.size()));
@@ -315,8 +320,9 @@ void LinkSession::handleFrame(const jcl::Frame &f)
             }
             file.write(m_db.data);
             file.close();
-            dbFinish(true, QStringLiteral("导出成功：%1（%2 B）")
-                              .arg(m_db.path).arg(m_db.data.size()));
+            dbFinish(true, QStringLiteral("导出成功：%1（%2 B%3）")
+                              .arg(m_db.path).arg(m_db.data.size())
+                              .arg(m_db.stray ? QStringLiteral("，忽略 %1 个残留分片").arg(m_db.stray) : QString()));
         }
         break;
     }

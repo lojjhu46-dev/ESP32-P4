@@ -90,6 +90,14 @@ private:
     QLabel *m_sbDrop = nullptr;
     QLabel *m_sbLog = nullptr;
 
+    /* 识别投票诊断（识别页顶部 + 状态栏） */
+    QLabel *m_diagLabel = nullptr;
+    qint64  m_diagNextMs = 0;         /* 500ms 节流刷新 */
+    qint64  m_stuckSinceMs = 0;       /* 连续 tracking 起点 */
+    qint64  m_lastStuckLogMs = 0;     /* 告警 30s 冷却 */
+private:
+    void updateVoteDiag(const QJsonObject &obj);
+
     /* 流 */
     QSlider *m_fpsS = nullptr;
     QSpinBox *m_fpsSpin = nullptr;
@@ -158,6 +166,7 @@ private:
     QHash<QString, qint64> m_cloudSeen;
     bool         m_dbAutoUp = false;
     bool         m_dbUploadAfterExport = false;
+    bool         m_autoSyncRetry = false;   /* 自动同步失败后只补试一次，避免无限重试刷屏 */
     bool         m_pcTestMode = false;      /* PC 测试页激活时阻断生产云上报 */
     QString      m_dbSyncPath;
     QString      m_cloudImportPath;

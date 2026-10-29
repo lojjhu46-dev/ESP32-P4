@@ -149,6 +149,8 @@ static const char *detect_model_name(void)
 #define FACE_ENROLL_MIN_SCORE    0.60f  /* 注册质量门控：检测分下限 */
 #define FACE_ENROLL_MIN_PX       80     /* 注册质量门控：脸宽下限 px（640 宽下约 2.5~3m） */
 #define FACE_ENROLL_MAX_SHOTS    5      /* 多帧注册最多采 5 帧（3~5 帧足够） */
+#define FACE_ENROLL_DEDUP_SIM    0.95f  /* 与同人已有特征相似度超此值视为重复帧，不入库 */
+#define FACE_ENROLL_MAX_DUP      6      /* 连续被判定重复的上限，超过则放行一帧保证注册能收尾 */
 /* ---- F4 轻跟踪 + 特征提取节流（规划 P0-F4，2026-10-06）----
  * 同一张脸、位移很小的相邻帧不必每帧都跑 93ms 的 MFN 提特征：沿用上一帧结论、
  * 只更新人脸框（esp-who / esp-box 都是"检测每帧、特征按需"）。
@@ -240,9 +242,12 @@ int64_t          s_reg_last_us = 0;     /* 上一帧采集时刻（帧间隔拉�
 /* 本次注册会话已落库的 id：会话被打断时按它回滚，否则留下无名孤儿特征 */
 uint16_t         s_reg_ids[FACE_ENROLL_MAX_SHOTS] = { 0 };
 int              s_reg_id_cnt = 0;
+int              s_reg_dup = 0;         /* 本次会话被"太相似"挡掉的帧数（保证能收尾） */
 
-/* F2 时域平滑：最近 K 帧 top-1 结果环形缓冲（人脸离开即清空） */
-struct smooth_rec_t { uint16_t id; float sim; };
+/* F2 时域平滑：最近 K 帧 top-1 结果环形缓冲（人脸离开即清空）。
+ * key = "人"而不是 id：同一个人堆多条近重复特征时，top-1 会在这些 id 间来回跳，
+ * 按 id 计票每桶只剩 1~2 票，灰区（需 4 票）永远凑不满 → 一直 tracking 不报名字 */
+struct smooth_rec_t { uint16_t id; float sim; uint32_t key; };
 smooth_rec_t     s_smooth[FACE_SMOOTH_K];
 int              s_smooth_cnt = 0;      /* 已填充帧数 */
 int              s_smooth_pos = 0;      /* 下一写位置 */
@@ -307,6 +312,11 @@ int              s_multi_cache_n = 0;
 /* 结果帧附加诊断（匹配分支每帧刷新；<0 = 结果帧不带该字段） */
 int              s_dbg_stable = -1;
 float            s_dbg_sim_raw = 0.0f;
+/* 投票过程（上位机诊断用）：本帧 top-1 所属那口票仓的票数 / 本次要求的票数 / 窗口已填帧数 */
+int              s_dbg_votes = 0;
+int              s_dbg_need = 0;
+int              s_dbg_win = 0;
+int              s_dbg_raw_id = 0;      /* 本帧 top-1 的槽号：高分却查不到名字时靠它定位 */
 /* 缓存一致性诊断（HANDOVER 廿一节）：生产者指纹在 fr.crc32/fr.dec_core，
  * 这里存消费者侧指纹与所在核 */
 uint32_t         s_dbg_ai_crc = 0;
@@ -474,20 +484,34 @@ static void smooth_reset(void)
     s_smooth_pos = 0;
 }
 
+/* 票仓 key：有名字的按人合并（名字 FNV-1a），无名的仍按 id 各自成桶 */
+static uint32_t smooth_key(uint16_t id)
+{
+    const char *nm = name_find_name(id);
+    if (!nm || !nm[0]) return 0x80000000u | (uint32_t)id;
+    uint32_t h = 2166136261u;
+    for (const char *p = nm; *p; p++) h = (h ^ (uint8_t)*p) * 16777619u;
+    if (h == 0 || (h & 0x80000000u)) h = (h & 0x7FFFFFFFu) | 1u;   /* 不与无名桶撞号 */
+    return h;
+}
+
 static void smooth_push(uint16_t id, float sim)
 {
     s_smooth[s_smooth_pos].id = id;
     s_smooth[s_smooth_pos].sim = sim;
+    s_smooth[s_smooth_pos].key = smooth_key(id);
     s_smooth_pos = (s_smooth_pos + 1) % FACE_SMOOTH_K;
     if (s_smooth_cnt < FACE_SMOOTH_K) s_smooth_cnt++;
 }
 
-/* 窗口统计：
- *   best_id/best_cnt/best_sim = 出现帧数最多的 id（并列取 sim 更高者）及其帧数、窗口内最大 sim
+/* 窗口统计（按"人"分桶）：
+ *   best_id/best_cnt/best_sim = 票数最多的那个人（取其桶内 sim 最高的 id 作代表）、
+ *                               票数、桶内最高 sim
  *   win_max = 全窗（含未命中帧，sim=0）最大 sim */
 static void smooth_tally(uint16_t *best_id, int *best_cnt, float *best_sim, float *win_max)
 {
-    uint16_t ids[FACE_SMOOTH_K];
+    uint32_t keys[FACE_SMOOTH_K];
+    uint16_t rep[FACE_SMOOTH_K] = { 0 };
     int cnt[FACE_SMOOTH_K] = { 0 };
     float mx[FACE_SMOOTH_K] = { 0 };
     int n = 0;
@@ -497,17 +521,17 @@ static void smooth_tally(uint16_t *best_id, int *best_cnt, float *best_sim, floa
         if (r.sim > *win_max) *win_max = r.sim;
         int f = -1;
         for (int j = 0; j < n; j++) {
-            if (ids[j] == r.id) { f = j; break; }
+            if (keys[j] == r.key) { f = j; break; }
         }
-        if (f < 0) { ids[n] = r.id; f = n++; }
+        if (f < 0) { keys[n] = r.key; rep[n] = r.id; f = n++; }
         cnt[f]++;
-        if (r.sim > mx[f]) mx[f] = r.sim;
+        if (r.sim > mx[f]) { mx[f] = r.sim; rep[f] = r.id; }
     }
     *best_id = 0; *best_cnt = 0; *best_sim = 0.0f;
     for (int j = 0; j < n; j++) {
-        if (ids[j] == 0) continue;             /* id 0 = 空库/无返回，不算候选 */
+        if (rep[j] == 0) continue;              /* id 0 = 空库/无返回，不算候选 */
         if (cnt[j] > *best_cnt || (cnt[j] == *best_cnt && mx[j] > *best_sim)) {
-            *best_id = ids[j]; *best_cnt = cnt[j]; *best_sim = mx[j];
+            *best_id = rep[j]; *best_cnt = cnt[j]; *best_sim = mx[j];
         }
     }
 }
@@ -579,6 +603,97 @@ static esp_err_t db_read_feat_total(uint16_t *total_out)
     if (!ok) return ESP_FAIL;
     *total_out = hdr[0];
     return ESP_OK;
+}
+
+/* esp-dl 的 DataBase ctor 会丢弃 load 的返回值：face.db 头一旦是垃圾（典型是
+   clear_all_feats 的 remove()+重建之间被复位打断，读出 6 字节全 0xFF），对象就带着
+   total=65535/feat_len=65535 活着 —— 注册报 enroll failed、匹配永远解析不出名字，
+   表现为"删掉重注册后百分百识别不出"。这里自检并自愈成空库。 */
+/* 注册完成后强制"内存库 = 磁盘库"，并把两边的槽数一起打出来。
+   2026-10-28 实测出现过 live top1槽=1 而 face.db 里有效槽是 24-28 的双轨不一致：
+   名字表按内存号查、磁盘是另一套号 → 注册成功但匹配必然 reject。 */
+static bool db_ensure_healthy(const char *why);
+static void db_rebuild_id_map(const char *why);   /* 定义在 read_file_all 之后 */
+
+static void db_resync_from_disk(const char *why)
+{
+    if (!s_db_ok || !s_db) return;
+    uint16_t file_total = 0;
+    FILE *f = fopen(s_db_path, "rb");
+    uint16_t hdr[3] = { 0xFFFF, 0xFFFF, 0xFFFF };
+    if (f) {
+        if (fread(hdr, sizeof(hdr), 1, f) != 1) hdr[0] = 0xFFFF;
+        fclose(f);
+        file_total = hdr[0];
+    }
+    const int mem_valid = s_db->get_num_feats();
+    ESP_LOGI(TAG, "resync(%s): file total=%u valid=%u feat_len=%u | mem valid=%d names=%d",
+             why, (unsigned)hdr[0], (unsigned)hdr[1], (unsigned)hdr[2], mem_valid, s_name_cnt);
+    /* 走 JCLINK 转发给上位机：排查"内存号 != 磁盘号"时不必占用串口（开 COM3 会复位板子） */
+    app_usb_link_log("faceai: resync(%s) file total=%u valid=%u feat_len=%u | mem=%d names=%d",
+                     why, (unsigned)hdr[0], (unsigned)hdr[1], (unsigned)hdr[2], mem_valid, s_name_cnt);
+    if (!f || hdr[0] == 0xFFFF) {
+        db_ensure_healthy(why);
+        return;
+    }
+    const uint16_t want_len = s_feat ? (uint16_t)s_feat->get_feat_len() : 512;
+    if (hdr[2] != want_len || hdr[0] > MAX_FEATS || hdr[1] > hdr[0]) {
+        db_ensure_healthy(why);
+        return;
+    }
+    /* 重载：让 m_feats/槽号完全以磁盘为准（构造即 load） */
+    delete s_db;
+    s_db = new dl::recognition::DataBase(s_db_path, want_len);
+    s_db_ok = (s_db != nullptr);
+    if (s_db_ok && s_db->get_num_feats() != file_total) {
+        ESP_LOGW(TAG, "resync(%s): mem valid %d != file total %u after reload",
+                 why, s_db->get_num_feats(), (unsigned)file_total);
+    }
+    long fbytes = -1;
+    FILE *chk = fopen(s_db_path, "rb");
+    if (chk) {
+        fseek(chk, 0, SEEK_END);
+        fbytes = ftell(chk);
+        fclose(chk);
+    }
+    app_usb_link_log("faceai: resync(%s) 重载后 mem valid=%d file total=%u face.db=%ld B",
+                     why, s_db ? s_db->get_num_feats() : -1, (unsigned)file_total, fbytes);
+    smooth_reset();
+    s_trk_ok = false;
+    db_rebuild_id_map(why);
+}
+
+static bool db_ensure_healthy(const char *why)
+{
+    const uint16_t want_len = s_feat ? (uint16_t)s_feat->get_feat_len() : 512;
+    FILE *f = fopen(s_db_path, "rb");
+    uint16_t hdr[3] = { 0xFFFF, 0xFFFF, 0xFFFF };
+    if (f) {
+        if (fread(hdr, sizeof(hdr), 1, f) != 1) {
+            hdr[0] = hdr[1] = hdr[2] = 0xFFFF;
+        }
+        fclose(f);
+    }
+    const bool sane = f && hdr[2] == want_len && hdr[0] <= MAX_FEATS && hdr[1] <= hdr[0];
+    if (sane) {
+        return true;
+    }
+    ESP_LOGE(TAG, "db(%s): header invalid (total=%u valid=%u feat_len=%u, want %u) -> rebuild empty",
+             why, (unsigned)hdr[0], (unsigned)hdr[1], (unsigned)hdr[2], (unsigned)want_len);
+    app_usb_link_log("faceai: ⚠ face.db 头损坏(%s)，已重建为空库", why);
+    remove(s_db_path);
+    if (s_db) {
+        delete s_db;
+        s_db = nullptr;
+    }
+    s_db = new dl::recognition::DataBase(s_db_path, want_len);
+    s_db_ok = (s_db != nullptr);
+    s_reg_pending = false;
+    s_reg_id_cnt = 0;
+    smooth_reset();
+    s_trk_ok = false;
+    s_lib_dirty = true;
+    return !s_db_ok ? false : true;
 }
 
 static int lib_gc_orphans(const char *why)
@@ -663,6 +778,49 @@ static uint8_t *read_file_all(const char *path, size_t *len_out)
     buf[rd] = 0;
     if (len_out) *len_out = rd;
     return buf;
+}
+
+/* ---------------- query_feat 下标 → 真实槽号 ----------------
+ * esp-dl 的 DataBase::query_feat() 把 result_t.id 填成 m_feats 的 **1-based 下标**
+ * （上游源码里 `results.emplace_back(it->id, sim)` 被注释掉、换成了 `i`）。
+ * 只要库里出现过删除（产生空洞），下标就和槽号错位：查回来的"第 1 条"其实是 id 6，
+ * 拿 1 去查名表必然查不到 → 表现为"相似度 0.95 却完全不识别"。
+ * esp-dl 是无 remote 的 gitlink，补丁进不了版本库，所以板端自己维护映射表。 */
+static uint16_t s_id_of_index[MAX_FEATS + 1];   /* [1..n]：第 n 条有效特征的真实槽号 */
+static int      s_id_map_n = 0;
+
+static void db_rebuild_id_map(const char *why)
+{
+    s_id_map_n = 0;
+    size_t bytes = 0;
+    uint8_t *db = read_file_all(FACE_DB_PATH, &bytes);
+    if (!db || bytes < 6) {
+        free(db);
+        return;
+    }
+    uint16_t total, valid, flen;
+    memcpy(&total, db, 2);
+    memcpy(&valid, db + 2, 2);
+    memcpy(&flen, db + 4, 2);
+    const size_t rec = (size_t)2 + (size_t)flen * 4;
+    if (flen && total <= MAX_FEATS && bytes >= 6 + (size_t)total * rec) {
+        for (uint16_t i = 0; i < total && s_id_map_n < MAX_FEATS; i++) {
+            uint16_t id = 0;
+            memcpy(&id, db + 6 + (size_t)i * rec, 2);
+            if (id) s_id_of_index[++s_id_map_n] = id;
+        }
+    }
+    free(db);
+    ESP_LOGI(TAG, "idmap(%s): %d valid slot(s), first=%u last=%u", why, s_id_map_n,
+             s_id_map_n ? (unsigned)s_id_of_index[1] : 0u,
+             s_id_map_n ? (unsigned)s_id_of_index[s_id_map_n] : 0u);
+}
+
+/* 把 query_feat 返回的下标换算成槽号；越界返回 0（调用方按"没匹配上"处理） */
+static uint16_t db_slot_id(uint16_t idx)
+{
+    if (idx < 1 || idx > s_id_map_n) return 0;
+    return s_id_of_index[idx];
 }
 
 /* 解析名表 JSON 数组（[{id,name}...]）到 out；返回条数，-1 = JSON 非法。
@@ -926,6 +1084,12 @@ static void send_result(const char *event,
          * 仅流式结果帧携带（res 非空），命令 ack 不带。 */
         cJSON_AddNumberToObject(root, "stable", s_dbg_stable);
         cJSON_AddNumberToObject(root, "sim_raw", s_dbg_sim_raw);
+        /* 投票过程：票仓按"人"归并后的票数 / 本次要求的票数 / 窗口已填帧数。
+         * 用于看清"raw 落在灰区且票数凑不满"这类一直 tracking 不报名字的情况 */
+        cJSON_AddNumberToObject(root, "votes", s_dbg_votes);
+        cJSON_AddNumberToObject(root, "need", s_dbg_need);
+        cJSON_AddNumberToObject(root, "win", s_dbg_win);
+        cJSON_AddNumberToObject(root, "rid", s_dbg_raw_id);
         /* 缓存一致性诊断：frm_crc=生产者指纹（stride*height，含 MCU 填充列），
          * ai_crc=AI 输入指纹（row_bytes*height，重打包紧凑缓冲）——两者统计范围
          * 不同、数值恒不相等；正确用法是「同图各帧应各自恒定」（frm_crc 恒定=
@@ -1336,7 +1500,7 @@ static void multi_fill_secondary(const std::list<dl::detect::result_t> &det,
         if (!f) break;                       /* 提特征失败：本帧副脸到此为止 */
         std::vector<dl::recognition::result_t> q = s_db->query_feat(f, 0.0f, 1);
         const float qsim = q.empty() ? 0.0f : q.front().similarity;
-        const uint16_t qid = q.empty() ? 0 : q.front().id;
+        const uint16_t qid = q.empty() ? 0 : db_slot_id(q.front().id);
         const char *nm = (qid && qsim >= s_thr_lo) ? name_find_name(qid) : nullptr;
         s_multi[s_multi_n].res = best;
         s_multi[s_multi_n].name = nm ? nm : "";
@@ -1470,9 +1634,30 @@ static void handle_frame(const img_frame_t &fr)
                 msg = msgbuf;                    /* 保持 pending，等质量达标的一帧 */
             } else {
                 dl::TensorBase *f = feat_run(img, big->keypoint);
+                /* B：与同人已有特征几乎一样 → 不入库（否则一个人堆一堆近重复，
+                   既撑大 face.db，又让 top-1 在这些槽位间乱跳） */
+                bool too_soon = false;
+                if (f) {
+                    std::vector<dl::recognition::result_t> q =
+                        s_db->query_feat(f, FACE_ENROLL_DEDUP_SIM, 3);
+                    for (const auto &r : q) {
+                        const char *nm = name_find_name(db_slot_id(r.id));
+                        if (nm && strcmp(nm, s_reg_name) == 0) { too_soon = true; break; }
+                    }
+                }
+                bool skip_enroll = false;
+                if (too_soon) {
+                    if (s_reg_dup < FACE_ENROLL_MAX_DUP) {
+                        s_reg_dup++;
+                        skip_enroll = true;
+                        msg = "too similar, vary angle slightly";  /* 保持 pending，等换个角度 */
+                    } else {
+                        s_reg_dup = 0;      /* 人一直不动：放行一帧，保证注册能收尾 */
+                    }
+                }
                 uint16_t before = 0, after = 0;
                 const bool have_before = (db_read_feat_total(&before) == ESP_OK);
-                if (f && s_db->enroll_feat(f) == ESP_OK) {
+                if (f && !skip_enroll && s_db->enroll_feat(f) == ESP_OK) {
                     /* enroll_feat 只把特征追加到 num_feats_total+1、id 永不复用，所以读一次
                        face.db 头就知道新槽号。早先用 query_feat(0.999) 反查会命中同一个人的
                        旧特征，把名字绑到别人的槽上（2026-10-26 实测把 personB 顶成了 personA）。
@@ -1497,6 +1682,7 @@ static void handle_frame(const img_frame_t &fr)
                             if (s_reg_got >= s_reg_shots) {
                                 names_save();
                                 s_reg_id_cnt = 0;   /* 会话已落盘，回滚不再适用 */
+                                db_resync_from_disk("registered");  /* 内存号必须等于磁盘号 */
                                 match_name = s_reg_name;    /* 结果里带上刚注册的名字，host 可核对 */
                                 event = "registered";
                                 s_lib_dirty = true;
@@ -1556,7 +1742,8 @@ static void handle_frame(const img_frame_t &fr)
         } else {
             /* 无门槛取 top-1：灰区判定与阈值标定（sim_raw）都需要真实最优相似度 */
             std::vector<dl::recognition::result_t> q = s_db->query_feat(f, 0.0f, 1);
-            uint16_t raw_id = q.empty() ? 0 : q.front().id;
+            /* query_feat 给的是下标，必须换算成槽号才能查名表 */
+            uint16_t raw_id = q.empty() ? 0 : db_slot_id(q.front().id);
             float raw_sim = q.empty() ? 0.0f : q.front().similarity;
             s_dbg_sim_raw = raw_sim;
 #if CONFIG_APP_FACEAI_DIAG_KP
@@ -1590,6 +1777,10 @@ static void handle_frame(const img_frame_t &fr)
                 /* F3 确认帧数：>=HI 需 M 帧；LO..HI 灰区需 M+1 帧（更严） */
                 const int need = (best_sim >= s_thr_hi) ? FACE_SMOOTH_M
                                                         : FACE_SMOOTH_M + 1;
+                s_dbg_votes = best_cnt;         /* 上位机诊断：票数/需求/窗口 */
+                s_dbg_need = need;
+                s_dbg_win = s_smooth_cnt;
+                s_dbg_raw_id = raw_id;
                 /* F2 快速通道：本帧裸相似度足够高就不等票数（检出间歇时窗口
                  * 凑不满票是命中率真瓶颈，第廿二节第 8 节）。只信"本帧自己的
                  * 强测量"——多人库时名字取本帧 top-1 的 id，不是窗口多数派。 */
@@ -2239,6 +2430,101 @@ static void db_backup_current(void)
                      ok ? "ok" : "partial");
 }
 
+/* 压实 face.db：把有效特征重写成连续槽位（id 1..n），空洞全部回收。三个理由：
+ *  ① 删除只置洞、文件只增不减（实测涨到 98 KB / 48 槽而只有 5 条有效）；
+ *  ② 信封太大时 0x06 分片要和 H.264 活流抢 TX，导出会中途丢片（实测停在第 3 片）；
+ *  ③ enroll_feat 的记录按 SEEK_END 追加、槽号却按 num_feats_total+1 算，文件一旦比
+ *    "6 + total×2050" 长，槽号与物理位置就永久脱钩（实测 live top1槽=1 而磁盘是 24–28）。
+ * 名表按 old→new 同步重写；动盘前先把旧库备份到 face_bak.db/names.bak。 */
+#define DB_COMPACT_HOLE_MIN 4          /* 空洞少于这个数不值得动盘 */
+
+static void db_compact(const char *why)
+{
+    if (!s_db_ok || !s_db || s_name_cnt == 0) return;
+    size_t bytes = 0;
+    uint8_t *db = read_file_all(FACE_DB_PATH, &bytes);
+    if (!db || bytes < 6) {
+        free(db);
+        return;
+    }
+    uint16_t total, valid, flen;
+    memcpy(&total, db, 2);
+    memcpy(&valid, db + 2, 2);
+    memcpy(&flen, db + 4, 2);
+    const size_t rec = (size_t)2 + (size_t)flen * 4;
+    const bool sane = flen > 0 && flen <= 4096 && total <= MAX_FEATS && valid <= total &&
+                      bytes >= 6 + (size_t)total * rec &&
+                      (int)total - (int)valid >= DB_COMPACT_HOLE_MIN;
+    if (!sane) {
+        free(db);
+        return;
+    }
+    uint8_t *outbuf = (uint8_t *)malloc(6 + (size_t)valid * rec);
+    static uint16_t new_id_of[MAX_FEATS + 1];      /* old id -> new id（0=丢弃） */
+    if (!outbuf) {
+        free(db);
+        return;
+    }
+    memset(new_id_of, 0, sizeof(new_id_of));
+    memcpy(outbuf, db, 6);
+    int n = 0;
+    for (uint16_t i = 0; i < total && n < (int)valid; i++) {
+        const size_t off = 6 + (size_t)i * rec;
+        uint16_t old_id = 0;
+        memcpy(&old_id, db + off, 2);
+        if (!old_id) continue;
+        n++;
+        if (old_id <= MAX_FEATS) new_id_of[old_id] = (uint16_t)n;
+        const size_t dst = 6 + (size_t)(n - 1) * rec;
+        memcpy(outbuf + dst, &n, 2);                       /* 新槽号 */
+        memcpy(outbuf + dst + 2, db + off + 2, (size_t)flen * 4);
+    }
+    free(db);
+    const size_t out_bytes = 6 + (size_t)n * rec;
+    const uint16_t new_total = (uint16_t)n;
+    memcpy(outbuf, &new_total, 2);
+    memcpy(outbuf + 2, &new_total, 2);
+
+    db_backup_current();
+    bool ok = false;
+    FILE *f = fopen(DBX_FACE_TMP, "wb");
+    if (f) {
+        ok = (fwrite(outbuf, 1, out_bytes, f) == out_bytes) && (fflush(f) == 0);
+        fclose(f);
+    }
+    free(outbuf);
+    if (!ok) {
+        remove(DBX_FACE_TMP);
+        ESP_LOGE(TAG, "compact(%s): tmp write failed", why);
+        return;
+    }
+    remove(FACE_DB_PATH);
+    if (rename(DBX_FACE_TMP, FACE_DB_PATH) != 0) {
+        ESP_LOGE(TAG, "compact(%s): replace failed", why);
+        return;
+    }
+    int w = 0;
+    for (int i = 0; i < s_name_cnt; i++) {
+        const uint16_t mapped = (s_names[i].id <= MAX_FEATS) ? new_id_of[s_names[i].id] : 0;
+        if (!mapped) continue;
+        s_names[i].id = mapped;
+        s_names[w++] = s_names[i];
+    }
+    s_name_cnt = w;
+    names_save();
+    delete s_db;
+    s_db = new dl::recognition::DataBase(FACE_DB_PATH, flen);
+    s_db_ok = (s_db != nullptr);
+    s_reg_pending = false;
+    s_reg_id_cnt = 0;
+    smooth_reset();
+    s_trk_ok = false;
+    s_lib_dirty = true;
+    ESP_LOGW(TAG, "compact(%s): slots->%d valid, names %d", why, n, s_name_cnt);
+    app_usb_link_log("faceai: compact(%s) 槽位压实 -> %d 条连续槽，名表 %d 条", why, n, s_name_cnt);
+    db_rebuild_id_map(why);
+}
+
 /* 0x06 回调（rx 任务上下文）：只做"按偏移顺序追加"，异常留给收尾整批拒绝 */
 static void db_blob_cb(const uint8_t *payload, uint32_t len)
 {
@@ -2270,6 +2556,7 @@ static void db_export_run(void)
     uint8_t *names_buf = nullptr, *face_buf = nullptr, *env = nullptr, *chunk = nullptr;
     size_t names_len = 0, face_len = 0;
     uint32_t total = 0, crc = 0, parts = 0;
+    int lost = 0;
     cJSON *d = nullptr;
     char msg[128];
 
@@ -2332,10 +2619,25 @@ static void db_export_run(void)
         uint32_t n = (total - off < JCL_BLOB_CHUNK_DEF) ? (total - off) : JCL_BLOB_CHUNK_DEF;
         memcpy(chunk, &off, 4);
         memcpy(chunk + 4, env + off, n);
-        if (app_usb_link_send(JCL_TYPE_BLOB, chunk, n + 4) != ESP_OK) {
-            ESP_LOGW(TAG, "dbx: export part %u/%u send failed", (unsigned)(i + 1), (unsigned)parts);
+        /* USB TX 忙时会拒写（0x06 要和 0x07 活流抢 tx_lock）：静默丢片会让上位机
+           永远收不满、只能等看门狗超时，所以这里重试，实在发不出去就明确报错收尾。 */
+        bool sent = false;
+        for (int t = 0; t < 4 && !sent; t++) {
+            sent = (app_usb_link_send(JCL_TYPE_BLOB, chunk, n + 4) == ESP_OK);
+            if (!sent) {
+                ESP_LOGW(TAG, "dbx: export part %u/%u retry %d", (unsigned)(i + 1),
+                         (unsigned)parts, t + 1);
+                vTaskDelay(pdMS_TO_TICKS(60));
+            }
         }
+        if (!sent) lost++;
         vTaskDelay(pdMS_TO_TICKS(20));       /* 分片间留 20ms：USB CDC 突发 16KB 会丢字节 */
+    }
+    if (lost) {
+        snprintf(msg, sizeof(msg), "export aborted: %d/%u part(s) unsent", lost, (unsigned)parts);
+        ESP_LOGE(TAG, "dbx: %s", msg);
+        app_usb_link_log("faceai: ⚠ %s", msg);
+        send_result("error", nullptr, 0, nullptr, 0, msg);
     }
 
 out:
@@ -2484,9 +2786,11 @@ static void db_import_end(void)
     }
     s_db = new dl::recognition::DataBase(FACE_DB_PATH, s_feat ? s_feat->get_feat_len() : 512);
     s_db_ok = (s_db != nullptr);
+    db_ensure_healthy("dbx");
     s_reg_pending = false;
     s_reg_id_cnt = 0;
     lib_gc_orphans("dbx");
+    db_rebuild_id_map("dbx");
 
     /* 复位识别侧缓存（同 clear/delete 的清单一套） */
     smooth_reset();
@@ -2602,7 +2906,9 @@ static bool testlib_set(bool on, bool reset)
     s_reg_pending = false;
     s_reg_shots = 0;
     s_reg_id_cnt = 0;
+    db_ensure_healthy(on ? "testlib-on" : "testlib-off");
     lib_gc_orphans(on ? "testlib-on" : "testlib-off");
+    db_rebuild_id_map(on ? "testlib-on" : "testlib-off");
     s_lib_dirty = true;
     ESP_LOGW(TAG, "testlib -> %s (%s, %d feat(s))", on ? "on" : "off", s_db_path,
              s_db ? s_db->get_num_feats() : 0);
@@ -2784,6 +3090,7 @@ static void handle_cmd(const char *json)
                     reg_rollback();         /* 上一轮没采完：先撤掉它的无名特征 */
                 }
                 s_reg_id_cnt = 0;
+                s_reg_dup = 0;
                 strlcpy(s_reg_name, name, sizeof(s_reg_name));
                 s_reg_arm_us = esp_timer_get_time();
                 s_reg_pending = true;
@@ -2820,6 +3127,9 @@ static void handle_cmd(const char *json)
             if (removed) {
                 name_remove_by_name(name);
                 names_save();
+                db_resync_from_disk("deleted");   /* 删除后同样强制内存号=磁盘号 */
+                db_compact("deleted");            /* 刚腾出的空洞立刻回收，避免文件只增不减 */
+                db_rebuild_id_map("deleted");
                 s_lib_dirty = true;
                 smooth_reset();                 /* 已删 id 不能残留在确认窗里 */
                 s_trk_ok = false;               /* F4：同上，被删的人不能继续被复用 */
@@ -3285,6 +3595,7 @@ static void handle_cmd(const char *json)
         send_result("list", nullptr, 0, nullptr, 0, nullptr);
     } else if (strcmp(cmd, "clear") == 0) {
         if (s_db_ok) s_db->clear_all_feats();
+        db_ensure_healthy("clear");          /* remove+重建之间被打断会留下 0xFF 头，当场校验 */
         s_name_cnt = 0;
         names_save();
         s_lib_dirty = true;
@@ -3430,9 +3741,12 @@ static void faceai_task(void *arg)
     if (s_wl != WL_INVALID_HANDLE) {
         s_db = new dl::recognition::DataBase(FACE_DB_PATH, s_feat->get_feat_len());
         s_db_ok = true;
+        db_ensure_healthy("boot");
         ESP_LOGI(TAG, "feature db %s: %d feat(s) in lib, name table %d", FACE_DB_PATH,
-                 s_db->get_num_feats(), s_name_cnt);
+                 s_db ? s_db->get_num_feats() : -1, s_name_cnt);
         lib_gc_orphans("boot");
+        db_compact("boot");            /* 回收历史空洞：文件小了导出才发得完，槽号也必然连续 */
+        db_rebuild_id_map("boot");
     }
     ESP_LOGI(TAG, "models loaded in %d ms (detect=%s thr=%.2f match_thr=%.2f/%.2f lo/hi feat_len=%d)",
              (int)((esp_timer_get_time() - t0) / 1000), detect_model_name(), (double)det_thr,

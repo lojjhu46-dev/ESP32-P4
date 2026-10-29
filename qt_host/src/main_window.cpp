@@ -238,6 +238,11 @@ MainWindow::MainWindow(QWidget *parent)
     });
     connect(m_link, &LinkSession::logLine, this, [this](const QString &l) {
         m_sbLog->setText(l);
+        /* 板端每秒刷十几行 imgpipe 统计/画像行，会把日志环形缓冲（2000 行）
+           在两三分钟内冲干净，出问题时反而查不到证据 —— 这类周期行只进状态栏 */
+        if (l.startsWith(QStringLiteral("imgpipe"))) {
+            return;
+        }
         appendLog(QStringLiteral("[板端] %1").arg(l));
     });
     connect(m_link, &LinkSession::sessionError, this, &MainWindow::statusError);
@@ -306,6 +311,7 @@ MainWindow::MainWindow(QWidget *parent)
         m_importBtn->setEnabled(true);
 
         const bool wantUpload = m_dbUploadAfterExport;
+        const bool wasAuto = m_dbAutoUp;
         m_dbAutoUp = false;
         m_dbUploadAfterExport = false;
         if (ok && wantUpload && !m_dbSyncPath.isEmpty()) {
@@ -317,6 +323,7 @@ MainWindow::MainWindow(QWidget *parent)
                     appendLog(QStringLiteral("☁ 人脸库已导出（%1 B），正在上传…").arg(data.size()));
                     m_cloudState->setText(QStringLiteral("正在上传人脸库…"));
                     m_cloud->pushSnapshot(data);
+                    m_autoSyncRetry = false;
                 } else {
                     statusError(QStringLiteral("云签到：导出文件为空"));
                 }
@@ -324,7 +331,20 @@ MainWindow::MainWindow(QWidget *parent)
                 statusError(QStringLiteral("云签到：读取导出文件失败"));
             }
         } else if (!ok && wantUpload) {
-            appendLog(QStringLiteral("✗ 云签到：板端导出失败"));
+            appendLog(QStringLiteral("✗ 云签到：板端导出失败：%1").arg(msg));
+            if (wasAuto && !m_autoSyncRetry) {
+                m_autoSyncRetry = true;
+                appendLog(QStringLiteral("⟳ 自动同步失败，3 秒后重试一次…"));
+                QTimer::singleShot(3000, this, [this]() {
+                    if (m_cloudOn->isChecked() && m_cloudAutoSync->isChecked()) {
+                        pushFacebank(true);
+                    }
+                });
+            } else if (wasAuto) {
+                m_autoSyncRetry = false;
+                appendLog(QStringLiteral("✗ 自动同步重试仍失败：%1 —— 名单变化未上传，"
+                                         "可在「云」页手动点「上传板端人脸库到云端」").arg(msg));
+            }
         }
         if (!m_cloudImportPath.isEmpty()) {
             QFile::remove(m_cloudImportPath);
@@ -436,7 +456,7 @@ void MainWindow::buildUi()
 
     m_logView = new QPlainTextEdit;
     m_logView->setReadOnly(true);
-    m_logView->setMaximumBlockCount(500);
+    m_logView->setMaximumBlockCount(2000);
     m_logView->setFixedHeight(132);
     m_logView->setProperty("cls", QStringLiteral("log"));
 
@@ -769,6 +789,10 @@ QWidget *MainWindow::buildRecognizeTab()
     auto *page = new QWidget;
     auto *v = new QVBoxLayout(page);
     v->setSpacing(10);
+
+    m_diagLabel = hintLabel(QStringLiteral("实时投票：等待结果帧…"));
+    m_diagLabel->setObjectName(QStringLiteral("diagVote"));   /* UIA 定位用 */
+    v->addWidget(m_diagLabel);
 
     m_detChk = new QCheckBox(QStringLiteral("启用检测"));
     m_detChk->setChecked(true);
@@ -1378,6 +1402,7 @@ void MainWindow::appendLog(const QString &line)
 void MainWindow::onResultFrame(const QJsonObject &obj)
 {
     m_view->setResult(obj);
+    updateVoteDiag(obj);
 
     if (obj.contains(QStringLiteral("boxes"))) {
         m_lastBoxes = obj.value(QStringLiteral("boxes")).toArray();
@@ -1399,6 +1424,7 @@ void MainWindow::onResultFrame(const QJsonObject &obj)
         if (ev == QLatin1String("registered") || ev == QLatin1String("deleted")) {
             cmd(cmdObj(QStringLiteral("list")));
             if (m_cloudOn->isChecked() && m_cloudAutoSync->isChecked() && !m_pcTestMode) {
+                m_autoSyncRetry = false;   /* 新的名单变化：重试额度重置 */
                 /* 等在途结果/落盘稳定后再导出，避免与注册收尾抢 storage */
                 QTimer::singleShot(900, this, [this]() { pushFacebank(true); });
             }
@@ -1408,6 +1434,49 @@ void MainWindow::onResultFrame(const QJsonObject &obj)
         onCloudMatch(obj);
     }
     syncFromResult(obj);
+}
+
+/* 板端每个比对帧带 votes/need/win（票仓按"人"归并后的票数）。
+   灰区里"raw 不够高 + 票数凑不满"会让板端一直停在 tracking 不报名字——
+   没有这行诊断就只能靠猜，所以把它显示出来并在卡住时告警。 */
+void MainWindow::updateVoteDiag(const QJsonObject &obj)
+{
+    const QString ev = obj.value(QStringLiteral("event")).toString();
+    if (!obj.contains(QStringLiteral("votes"))) {
+        return;
+    }
+    const int votes = obj.value(QStringLiteral("votes")).toInt();
+    const int need = obj.value(QStringLiteral("need")).toInt();
+    const int win = obj.value(QStringLiteral("win")).toInt();
+    const int rid = obj.value(QStringLiteral("rid")).toInt();
+    const double raw = obj.value(QStringLiteral("sim_raw")).toDouble();
+    const double sim = obj.value(QStringLiteral("sim")).toDouble();
+    const int stable = obj.value(QStringLiteral("stable")).toInt();
+    const QString name = obj.value(QStringLiteral("match")).toString();
+
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    if (m_diagLabel && now >= m_diagNextMs) {
+        m_diagNextMs = now + 500;
+        m_diagLabel->setText(QStringLiteral(
+            "实时投票：结论 %1%2 · sim %3 · raw %4 · 票数 %5/%6 · 窗口 %7 帧 · top1槽 %8 · stable %9")
+            .arg(ev,
+                 name.isEmpty() ? QString() : QStringLiteral("（%1）").arg(name))
+            .arg(sim, 0, 'f', 3).arg(raw, 0, 'f', 3)
+            .arg(votes).arg(need).arg(win).arg(rid).arg(stable));
+    }
+    m_sbLog->setText(QStringLiteral("票 %1/%2 · raw %3").arg(votes).arg(need).arg(raw, 0, 'f', 3));
+
+    if (ev == QLatin1String("tracking") && win >= 5) {
+        if (m_stuckSinceMs == 0) {
+            m_stuckSinceMs = now;
+        } else if (now - m_stuckSinceMs > 5000 && now - m_lastStuckLogMs > 30000) {
+            m_lastStuckLogMs = now;
+            appendLog(QStringLiteral("⚠ 识别卡在投票：raw %1 票数 %2/%3（窗口已满仍未确认）")
+                          .arg(raw, 0, 'f', 3).arg(votes).arg(need));
+        }
+    } else {
+        m_stuckSinceMs = 0;
+    }
 }
 
 void MainWindow::syncFromResult(const QJsonObject &obj)

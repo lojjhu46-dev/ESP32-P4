@@ -437,10 +437,13 @@ class Handler(BaseHTTPRequestHandler):
 
         con = db.connect(self.server.db_path)
         try:
-            # Rolling window looks BACK only; +60s tolerates client clock skew.
-            # A symmetric +/- window would let a future-dated event suppress past ones.
+            # Symmetric window on purpose: after a network outage the upper
+            # computer flushes its spool out of chronological order, and a
+            # look-back-only window lets a late-arriving older event slip
+            # through next to an already stored newer one (observed 2026-10-29:
+            # two personA check-ins 13 min apart both stored).
             dup_id = db.recent_event(
-                con, person, device, ts - cfg["dedup_window_s"], ts + 60
+                con, person, device, ts - cfg["dedup_window_s"], ts + cfg["dedup_window_s"]
             )
             if dup_id:
                 self._json(200, {"ok": True, "dup": True, "id": dup_id})

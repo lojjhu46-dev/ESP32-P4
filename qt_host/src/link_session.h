@@ -120,6 +120,7 @@ private:
         QByteArray data;                  /* 导出=接收缓冲；导入=待发送数据 */
         quint32    expectSize = 0, expectCrc = 0, got = 0;
         int        sentChunks = 0, totalChunks = 0;
+        int        stray = 0;                 /* 被忽略的上一轮残留/非单调分片数 */
         QTimer    *pump = nullptr;
         QTimer    *watchdog = nullptr;    /* 分片停住即判失败，否则 busy 永久卡死 */
     };
